@@ -45,6 +45,7 @@ import {
   getContextWindow,
   isVisionNativeModel,
   ERR_CONTEXT_OVERFLOW,
+  isRecoverableTransportError,
   getThoughtLevels,
   resolveThoughtLevel,
   isThoughtLevel,
@@ -864,6 +865,7 @@ export class GlmAcpAgent implements Agent {
       if (userMessageId) cancelled.userMessageId = userMessageId;
       return cancelled;
     };
+    let userMessage: GlmMessage | undefined;
 
     try {
       if (predecessor) {
@@ -903,7 +905,7 @@ export class GlmAcpAgent implements Agent {
       const userContent = visionNative
         ? renderVisionNativePromptBlocks(preprocessed.blocks)
         : renderPromptBlocks(preprocessed.blocks).content;
-      const userMessage: GlmMessage = { role: "user", content: userContent };
+      userMessage = { role: "user", content: userContent };
       session.messages.push(userMessage);
 
       // What the user typed, rendered from the blocks as they arrived — before
@@ -963,6 +965,35 @@ export class GlmAcpAgent implements Agent {
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
       if (abortController.signal.aborted || !ownsPrompt()) {
+        return cancelledResponse();
+      }
+      // A dropped provider connection must not fail the JSON-RPC prompt.
+      // Paseo and other clients turn a thrown error into -32603 and then keep
+      // sending later prompts through the same dead HTTP client. End the turn
+      // as cancelled, keep any text that already streamed, and leave the
+      // session idle so the next message opens a new connection.
+      if (isRecoverableTransportError(err) && userMessage) {
+        const start = session.messages.indexOf(userMessage);
+        const keptWork = start >= 0 && session.messages.slice(start + 1)
+          .some((message) => message.role === "assistant" || message.role === "tool");
+        if (start >= 0 && !keptWork) {
+          session.messages.splice(start, 1);
+          session.displayText.delete(userMessage);
+        }
+        session.updatedAt = new Date().toISOString();
+        await this.persistSession(params.sessionId, session);
+        await safeSessionUpdate(this.connection, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: keptWork
+                ? "\n\nConnection lost. Send a message to continue.\n"
+                : "\n\nConnection lost. Send the message again when you are back online.\n",
+            },
+          },
+        });
         return cancelledResponse();
       }
       // Surface the error to the user as an agent message so the IDE displays
