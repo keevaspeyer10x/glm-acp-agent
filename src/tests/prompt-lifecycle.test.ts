@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -40,6 +40,671 @@ function textGlm(onCall: (messages: unknown[]) => void = () => {}) {
 
 function imagePrompt() {
   return [{ type: "image" as const, data: "AAAA", mimeType: "image/png" }];
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
+async function withoutNotificationRelease<T>(promise: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("prompt/close waited for held notification")), 2_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+for (const cancelAtNotice of [false, true]) {
+  test(`${cancelAtNotice ? "cancelling" : "completing"} the turn-limit notice preserves completed writes and usage before close`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-turn-limit-checkpoint-"));
+    const storeRoot = join(cwd, "sessions");
+    const store = new SessionStore(storeRoot);
+    const conn = connection();
+    const held = deferred<void>();
+    const started = deferred<void>();
+    const sendUpdate = conn.sessionUpdate;
+    conn.sessionUpdate = async params => {
+      await sendUpdate(params);
+      const update = params.update as { sessionUpdate?: string; content?: { text?: string } };
+      if (update.sessionUpdate === "agent_message_chunk" && update.content?.text?.includes("[stopped: reached")) {
+        started.resolve();
+        await held.promise;
+      }
+    };
+    let modelCalls = 0;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelCalls += 1;
+        yield { usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } };
+        yield { toolCall: { id: "completed-write", name: "write_file", arguments: JSON.stringify({
+          path: "written.txt", content: "completed side effect",
+        }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store, maxTurns: 1 });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await store.flush();
+    const prompt = agent.prompt({ sessionId, messageId: "write-once", prompt: [{ type: "text", text: "write once" }] });
+    try {
+      await withoutNotificationRelease(started.promise);
+      assert.equal(await readFile(join(cwd, "written.txt"), "utf8"), "completed side effect");
+      if (cancelAtNotice) await agent.cancel({ sessionId });
+      else held.resolve();
+      const response = await withoutNotificationRelease(prompt);
+
+      // A fresh store must see the prompt's checkpoint before close, restore,
+      // or shutdown can supply an unrelated save and hide a missing write.
+      const history = new SessionStore(storeRoot).load(sessionId)?.messages;
+      const toolResult = history?.find(message => message.role === "tool" && message.tool_call_id === "completed-write");
+      const toolBatch = history?.find(message => message.role === "assistant" && message.tool_calls?.some(call => call.id === "completed-write"));
+      assert.deepEqual({ response, toolResult, toolCallIds: toolBatch?.role === "assistant" ? toolBatch.tool_calls?.map(call => call.id) : undefined }, {
+        response: {
+          stopReason: cancelAtNotice ? "cancelled" : "max_turn_requests",
+          usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 },
+          userMessageId: "write-once",
+        },
+        toolResult: { role: "tool", tool_call_id: "completed-write", content: "File written successfully: written.txt" },
+        toolCallIds: ["completed-write"],
+      });
+      const updateCount = conn.updates.length;
+      const permissionCount = conn.permissionRequests.length;
+      held.reject(new Error("late turn-limit notification rejection"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(conn.updates.length, updateCount, "late settlement must not resume notifications");
+      assert.equal(conn.permissionRequests.length, permissionCount);
+      assert.equal(modelCalls, 1, "the terminal notice must not start another model request");
+    } finally {
+      held.resolve();
+      await Promise.allSettled([prompt]);
+      await agent.closeSession({ sessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a turn-limit notification failure without cancellation still rejects the prompt", async () => {
+  const conn = connection();
+  const failure = new Error("turn-limit transport failed");
+  const sendUpdate = conn.sessionUpdate;
+  conn.sessionUpdate = async params => {
+    await sendUpdate(params);
+    const update = params.update as { content?: { text?: string } };
+    if (update.content?.text?.includes("[stopped: reached")) throw failure;
+  };
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { toolCall: { id: "completed-todo", name: "todowrite", arguments: JSON.stringify({
+        todos: [{ content: "Completed task", status: "completed" }],
+      }) } };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null, maxTurns: 1 });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await assert.rejects(agent.prompt({ sessionId, prompt: [{ type: "text", text: "finish the task" }] }), failure);
+  } finally {
+    await agent.closeSession({ sessionId });
+  }
+});
+
+for (const kind of ["text", "thought", "metadata", "error", "max-turn", "todo"] as const) {
+  test(`cancel and close unwind a held ${kind} notification and consume its late rejection`, async () => {
+    const conn = connection();
+    const held = deferred<void>();
+    const started = deferred<void>();
+    const sendUpdate = conn.sessionUpdate;
+    conn.sessionUpdate = async (params) => {
+      await sendUpdate(params);
+      const update = params.update as { sessionUpdate?: string; status?: string };
+      const target = kind === "thought" ? "agent_thought_chunk"
+        : kind === "metadata" ? "session_info_update"
+        : kind === "todo" ? "tool_call" : "agent_message_chunk";
+      if (update.sessionUpdate === target) {
+        started.resolve();
+        await held.promise;
+      }
+    };
+    let modelCalls = 0;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelCalls += 1;
+        if (kind === "error") throw new Error("provider fixture failed");
+        if (kind === "todo" || kind === "max-turn") {
+          yield { toolCall: { id: "todo-held", name: "todowrite", arguments: JSON.stringify({
+            todos: [{ content: "Completed task", status: "completed" }],
+          }) } };
+          yield { done: true, stopReason: "tool_calls" };
+        } else {
+          yield kind === "thought" ? { thinking: "thought before cancel", text: "stale same-chunk text" }
+            : { text: "text before cancel" };
+          yield { done: true, stopReason: "stop", usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 } };
+        }
+        if (kind === "text" || kind === "thought") yield { text: "stale after cancel" };
+      },
+    };
+    const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-held-notification-"));
+    const store = new SessionStore(storeRoot);
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store, maxTurns: 1 });
+    const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+    let close: Promise<unknown> | undefined;
+    try {
+      await started.promise;
+      await agent.cancel({ sessionId });
+      close = agent.closeSession({ sessionId });
+      const [response] = await withoutNotificationRelease(Promise.all([prompt, close]));
+      assert.equal(response.stopReason, "cancelled");
+      if (kind === "metadata") assert.deepEqual(response.usage, { inputTokens: 3, outputTokens: 2, totalTokens: 5 });
+      const updateCount = conn.updates.length;
+      held.reject(new Error("late notification rejection"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(conn.updates.length, updateCount, "late settlement must not resume UI updates");
+      assert.equal(modelCalls, 1, "cancel must not start another model request");
+      assert.ok(!conn.updates.some(update => JSON.stringify(update).includes("stale")));
+      const history = store.load(sessionId)?.messages;
+      if (kind === "text" || kind === "metadata") {
+        assert.ok(history?.some(message => message.role === "assistant" && message.content === "text before cancel"));
+      }
+      if (kind === "todo") {
+        assert.ok(history?.some(message => message.role === "tool" && message.tool_call_id === "todo-held" &&
+          String(message.content).includes("Todo list updated:")));
+      }
+    } finally {
+      held.resolve();
+      await Promise.allSettled([prompt, close]);
+      await agent.closeSession({ sessionId });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const status of ["pending", "in_progress", "completed", "failed"] as const) {
+  test(`cancel and close unwind a held ${status} tool card without losing known writes`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-held-tool-card-"));
+    const store = new SessionStore(join(cwd, "sessions"));
+    const conn = connection();
+    const held = deferred<void>();
+    const started = deferred<void>();
+    const sendUpdate = conn.sessionUpdate;
+    conn.sessionUpdate = async params => {
+      await sendUpdate(params);
+      const update = params.update as { status?: string };
+      if (update.status === status) {
+        started.resolve();
+        await held.promise;
+      }
+    };
+    let modelCalls = 0;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelCalls += 1;
+        yield { toolCall: { id: "write-held", name: "write_file", arguments: status === "failed" ? "null"
+          : JSON.stringify({ path: "written.txt", content: "completed side effect" }) } };
+        yield { toolCall: { id: "write-stale", name: "write_file", arguments: JSON.stringify({ path: "stale.txt", content: "stale" }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "write" }] });
+    let close: Promise<unknown> | undefined;
+    try {
+      await started.promise;
+      await agent.cancel({ sessionId });
+      close = agent.closeSession({ sessionId });
+      const [response] = await withoutNotificationRelease(Promise.all([prompt, close]));
+      assert.equal(response.stopReason, "cancelled");
+      assert.equal(modelCalls, 1);
+      assert.equal(existsSync(join(cwd, "stale.txt")), false, "the next write must not run");
+      const history = store.load(sessionId)?.messages;
+      const result = history?.find(message => message.role === "tool" && message.tool_call_id === "write-held");
+      assert.ok(result && result.role === "tool");
+      if (status === "completed") {
+        assert.equal(await readFile(join(cwd, "written.txt"), "utf8"), "completed side effect");
+        assert.equal(result.content, "File written successfully: written.txt");
+      } else {
+        assert.equal(existsSync(join(cwd, "written.txt")), false);
+      }
+      if (status === "failed") assert.match(String(result.content), /tool arguments must be a JSON object/i);
+      const updateCount = conn.updates.length;
+      const permissionCount = conn.permissionRequests.length;
+      held.resolve();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(conn.updates.length, updateCount);
+      assert.equal(conn.permissionRequests.length, permissionCount);
+      if (status === "pending") assert.equal(permissionCount, 0, "cancel must not start a permission request");
+    } finally {
+      held.resolve();
+      await Promise.allSettled([prompt, close]);
+      await agent.closeSession({ sessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("cancelled pending permission publishes a failed card without waiting for its delivery", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "glm-acp-cancelled-permission-card-"));
+  const storeRoot = join(cwd, "sessions");
+  const permission = deferred<{ outcome: { outcome: "selected"; optionId: string } }>();
+  const permissionStarted = deferred<void>();
+  const terminalDelivery = deferred<void>();
+  let writes = 0;
+  let modelCalls = 0;
+  const conn = {
+    ...connection(),
+    async requestPermission(params: unknown) {
+      conn.permissionRequests.push(params);
+      permissionStarted.resolve();
+      return permission.promise;
+    },
+    async writeTextFile() { writes += 1; },
+  };
+  conn.sessionUpdate = async params => {
+    conn.updates.push(params);
+    if ((params.update as { status?: string }).status === "failed") await terminalDelivery.promise;
+  };
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      modelCalls += 1;
+      yield { toolCall: { id: "permission-held", name: "write_file", arguments: JSON.stringify({ path: "written.txt", content: "do not write" }) } };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: new SessionStore(storeRoot) });
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { writeTextFile: true } } } as never);
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+  const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "write" }] });
+  try {
+    await withoutNotificationRelease(permissionStarted.promise);
+    await agent.cancel({ sessionId });
+    assert.equal((await withoutNotificationRelease(prompt)).stopReason, "cancelled");
+    const cards = conn.updates.map(params => params.update as { toolCallId?: string; status?: string; rawOutput?: unknown })
+      .filter(update => update.toolCallId === "permission-held");
+    assert.deepEqual(cards.map(card => card.status), ["pending", "failed"]);
+    assert.deepEqual(cards[1].rawOutput, { error: "Cancelled by turn." });
+    const result = new SessionStore(storeRoot).load(sessionId)?.messages.find(message => message.role === "tool" && message.tool_call_id === "permission-held");
+    assert.equal(result?.content, "Write cancelled by turn.", "the cancelled result must be durable before close");
+    assert.equal(writes, 0);
+    assert.equal(modelCalls, 1);
+    const updateCount = conn.updates.length;
+    terminalDelivery.reject(new Error("late failed-card delivery rejection"));
+    permission.resolve({ outcome: { outcome: "selected", optionId: "allow" } });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(conn.updates.length, updateCount, "late settlement must not resume notification work");
+    assert.equal(writes, 0, "late permission must not start an editor write");
+    assert.equal(conn.permissionRequests.length, 1);
+  } finally {
+    terminalDelivery.resolve();
+    permission.resolve({ outcome: { outcome: "selected", optionId: "allow" } });
+    await Promise.allSettled([prompt]);
+    await agent.closeSession({ sessionId });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+for (const outcome of ["completed", "failed"] as const) {
+  test(`an editor write ${outcome} after cancel publishes its actual terminal card without waiting for delivery`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-cancelled-write-card-"));
+    const storeRoot = join(cwd, "sessions");
+    const writeStarted = deferred<void>();
+    const writeRelease = deferred<void>();
+    const terminalDelivery = deferred<void>();
+    let writes = 0;
+    let modelCalls = 0;
+    const conn = {
+      ...connection(),
+      async writeTextFile(params: { path: string; content: string }) {
+        writes += 1;
+        writeStarted.resolve();
+        await writeRelease.promise;
+        if (outcome === "failed") throw new Error("editor refused the admitted write");
+        await writeFile(params.path, params.content);
+      },
+    };
+    conn.sessionUpdate = async params => {
+      conn.updates.push(params);
+      if ((params.update as { status?: string }).status === outcome) await terminalDelivery.promise;
+    };
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelCalls += 1;
+        yield { toolCall: { id: "write-admitted", name: "write_file", arguments: JSON.stringify({ path: "written.txt", content: "admitted write" }) } };
+        yield { toolCall: { id: "write-stale", name: "write_file", arguments: JSON.stringify({ path: "stale.txt", content: "do not write" }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: new SessionStore(storeRoot) });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { writeTextFile: true } } } as never);
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "write" }] });
+    try {
+      await withoutNotificationRelease(writeStarted.promise);
+      await agent.cancel({ sessionId });
+      writeRelease.resolve();
+      assert.equal((await withoutNotificationRelease(prompt)).stopReason, "cancelled");
+      const cards = conn.updates.map(params => params.update as { toolCallId?: string; status?: string; rawOutput?: unknown })
+        .filter(update => update.toolCallId === "write-admitted");
+      assert.deepEqual(cards.map(card => card.status), ["pending", "in_progress", outcome]);
+      assert.deepEqual(cards[2].rawOutput, outcome === "completed"
+        ? { success: true } : { error: "editor refused the admitted write" });
+      const messages = new SessionStore(storeRoot).load(sessionId)?.messages;
+      const result = messages?.find(message => message.role === "tool" && message.tool_call_id === "write-admitted");
+      assert.equal(result?.content, outcome === "completed"
+        ? "File written successfully: written.txt" : "Error writing file: editor refused the admitted write",
+      "the known editor outcome must be durable before close");
+      const skipped = messages?.find(message => message.role === "tool" && message.tool_call_id === "write-stale");
+      assert.equal(skipped?.content, "Tool call cancelled before execution.");
+      assert.equal(writes, 1);
+      assert.equal(modelCalls, 1);
+      assert.equal(conn.permissionRequests.length, 1);
+      assert.equal(existsSync(join(cwd, "stale.txt")), false);
+      if (outcome === "completed") assert.equal(await readFile(join(cwd, "written.txt"), "utf8"), "admitted write");
+      else assert.equal(existsSync(join(cwd, "written.txt")), false);
+      const updateCount = conn.updates.length;
+      terminalDelivery.reject(new Error("late terminal write-card delivery rejection"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(conn.updates.length, updateCount);
+      assert.equal(writes, 1);
+    } finally {
+      writeRelease.resolve();
+      terminalDelivery.resolve();
+      await Promise.allSettled([prompt]);
+      await agent.closeSession({ sessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const { toolName, status, args, statuses, permissionCount } of [
+  { toolName: "write_file", status: "pending", args: { path: "written.txt", content: "do not write" }, statuses: ["pending", "failed"], permissionCount: 0 },
+  { toolName: "write_file", status: "in_progress", args: { path: "written.txt", content: "do not write" }, statuses: ["pending", "in_progress", "failed"], permissionCount: 1 },
+  { toolName: "run_command", status: "in_progress", args: { command: "printf do-not-run > written.txt" }, statuses: ["pending", "in_progress", "failed"], permissionCount: 1 },
+  { toolName: "read_file", status: "in_progress", args: { path: "written.txt" }, statuses: ["in_progress", "failed"], permissionCount: 0 },
+  { toolName: "custom_mcp_tool", status: "in_progress", args: {}, statuses: ["in_progress", "failed"], permissionCount: 0 },
+] as const) {
+  test(`cancelled held ${status} ${toolName} announcement publishes a failed card and a cancelled-before-execution result`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-cancelled-announcement-card-"));
+    const storeRoot = join(cwd, "sessions");
+    const announcement = deferred<void>();
+    const announcementStarted = deferred<void>();
+    const terminalDelivery = deferred<void>();
+    let startedOperations = 0;
+    let modelCalls = 0;
+    const conn = {
+      ...connection(),
+      async readTextFile() { startedOperations += 1; return { content: "do not read" }; },
+      async writeTextFile() { startedOperations += 1; },
+    };
+    conn.sessionUpdate = async params => {
+      conn.updates.push(params);
+      const update = params.update as { status?: string };
+      if (update.status === status) {
+        announcementStarted.resolve();
+        await announcement.promise;
+      }
+      if (update.status === "failed") await terminalDelivery.promise;
+    };
+    const tools = {
+      toolDefinitions: [{ type: "function", function: { name: "custom_mcp_tool", description: "fixture", parameters: { type: "object" } } }],
+      hasTool: (name: string) => name === "custom_mcp_tool",
+      async callTool() { startedOperations += 1; return { content: [{ type: "text", text: "do not call" }] }; },
+      async dispose() {},
+    } as unknown as SessionMcpTools;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelCalls += 1;
+        yield { toolCall: { id: "announcement-held", name: toolName, arguments: JSON.stringify(args) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: new SessionStore(storeRoot), mcpConnector: async () => tools });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } } } as never);
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+    try {
+      await withoutNotificationRelease(announcementStarted.promise);
+      await agent.cancel({ sessionId });
+      assert.equal((await withoutNotificationRelease(prompt)).stopReason, "cancelled");
+      const cards = conn.updates.map(params => params.update as { toolCallId?: string; status?: string })
+        .filter(update => update.toolCallId === "announcement-held");
+      assert.deepEqual(cards.map(card => card.status), statuses);
+      const result = new SessionStore(storeRoot).load(sessionId)?.messages.find(message => message.role === "tool" && message.tool_call_id === "announcement-held");
+      assert.equal(result?.content, "Tool call cancelled before execution.", "an interrupted announcement must not imply an unknown side effect");
+      assert.equal(startedOperations, 0);
+      assert.equal(existsSync(join(cwd, "written.txt")), false, "cancelled command/write must not mutate the filesystem");
+      assert.equal(conn.permissionRequests.length, permissionCount);
+      assert.equal(modelCalls, 1);
+      const updateCount = conn.updates.length;
+      terminalDelivery.reject(new Error("late announcement failed-card delivery rejection"));
+      announcement.reject(new Error("late announcement delivery rejection"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(conn.updates.length, updateCount);
+      assert.equal(conn.permissionRequests.length, permissionCount);
+      assert.equal(startedOperations, 0);
+    } finally {
+      announcement.resolve();
+      terminalDelivery.resolve();
+      await Promise.allSettled([prompt]);
+      await agent.closeSession({ sessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("an abort during notification dispatch consumes the late rejected notification", async () => {
+  const conn = connection();
+  const held = deferred<void>();
+  const started = deferred<void>();
+  conn.sessionUpdate = params => {
+    conn.updates.push(params);
+    if ((params.update as { sessionUpdate?: string }).sessionUpdate === "agent_message_chunk") {
+      void agent.cancel({ sessionId: String(params.sessionId) });
+      started.resolve();
+      return held.promise;
+    }
+    return Promise.resolve();
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm: textGlm(), sessionStore: null });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+  try {
+    await started.promise;
+    assert.equal((await withoutNotificationRelease(prompt)).stopReason, "cancelled");
+    held.reject(new Error("late synchronously aborted notification"));
+    await new Promise<void>(resolve => setImmediate(resolve));
+  } finally {
+    held.resolve();
+    await Promise.allSettled([prompt]);
+    await agent.closeSession({ sessionId });
+  }
+});
+
+test("cancellation after a thought notification settles blocks its same-chunk text", async () => {
+  const conn = connection();
+  conn.sessionUpdate = params => {
+    conn.updates.push(params);
+    const delivered = Promise.resolve();
+    if ((params.update as { sessionUpdate?: string }).sessionUpdate === "agent_thought_chunk") {
+      void delivered.then(() => queueMicrotask(() => queueMicrotask(() => {
+        void agent.cancel({ sessionId: String(params.sessionId) });
+      })));
+    }
+    return delivered;
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-settled-notification-"));
+  const store = new SessionStore(storeRoot);
+  let advancedAfterCancellation = false;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { thinking: "delivered thought", text: "stale same-chunk text" };
+      advancedAfterCancellation = true;
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] })).stopReason, "cancelled");
+    assert.equal(advancedAfterCancellation, false, "an aborted owner must not request another stream chunk");
+    assert.ok(!store.load(sessionId)?.messages.some(message => String(message.content).includes("stale")));
+    assert.ok(!conn.updates.some(update => JSON.stringify(update).includes("stale")));
+  } finally {
+    await agent.closeSession({ sessionId });
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+for (const { toolName, transfer } of [
+  { toolName: "read_file", transfer: "cancel" },
+  { toolName: "list_files", transfer: "cancel" },
+  { toolName: "custom_mcp_tool", transfer: "cancel" },
+  { toolName: "read_file", transfer: "fork" },
+  { toolName: "read_file", transfer: "load" },
+  { toolName: "custom_mcp_tool", transfer: "fork" },
+  { toolName: "custom_mcp_tool", transfer: "load" },
+] as const) {
+  test(`cancellation after a ${toolName} announcement settles blocks its operation (${transfer})`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-settled-tool-announcement-"));
+    const store = new SessionStore(join(cwd, "sessions"));
+    let startedOperations = 0;
+    let transferPromise: Promise<unknown> | undefined;
+    let forkedSessionId: string | undefined;
+    let announced = false;
+    const conn = {
+      ...connection(),
+      async readTextFile() {
+        startedOperations += 1;
+        return { content: "stale file read" };
+      },
+      async writeTextFile() {},
+    };
+    conn.sessionUpdate = params => {
+      conn.updates.push(params);
+      const delivered = Promise.resolve();
+      if (!announced && (params.update as { status?: string }).status === "in_progress") {
+        announced = true;
+        void delivered.then(() => queueMicrotask(() => queueMicrotask(() => {
+          const sessionId = String(params.sessionId);
+          if (transfer === "cancel") {
+            void agent.cancel({ sessionId });
+          } else {
+            transferPromise = transfer === "fork"
+              ? agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] })
+              : agent.loadSession({ sessionId, cwd, mcpServers: [] });
+            void transferPromise.catch(() => undefined);
+          }
+        })));
+      }
+      return delivered;
+    };
+    const tools = {
+      toolDefinitions: [{ type: "function", function: { name: "custom_mcp_tool", description: "fixture", parameters: { type: "object" } } }],
+      hasTool: (name: string) => name === "custom_mcp_tool",
+      async callTool() {
+        startedOperations += 1;
+        return { content: [{ type: "text", text: "stale MCP side effect" }] };
+      },
+      async dispose() {},
+    } as unknown as SessionMcpTools;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield { toolCall: { id: "announced", name: toolName, arguments: JSON.stringify({ path: "." }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store, mcpConnector: async () => tools });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } } } as never);
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    try {
+      assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] })).stopReason, "cancelled");
+      if (transferPromise) {
+        const transferred = await transferPromise as { sessionId?: string };
+        if (transfer === "fork") forkedSessionId = transferred.sessionId;
+      }
+      assert.equal(startedOperations, 0, "cancel must not dispatch editor/MCP operations after announcement");
+      const result = store.load(sessionId)?.messages.find(message => message.role === "tool" && message.tool_call_id === "announced");
+      assert.equal(result?.content, "Tool call cancelled before execution.");
+    } finally {
+      await agent.closeSession({ sessionId });
+      if (forkedSessionId) await agent.closeSession({ sessionId: forkedSessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const transfer of ["close", "fork", "load"] as const) {
+  test(`${transfer} of an unresolved editor write waits for its actual result before checkpointing success`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-held-editor-write-"));
+    const store = new SessionStore(join(cwd, "sessions"));
+    const held = deferred<void>();
+    const started = deferred<void>();
+    const conn = {
+      ...connection(),
+      async writeTextFile() {
+        started.resolve();
+        await held.promise;
+      },
+    };
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield { toolCall: { id: "editor-write", name: "write_file", arguments: JSON.stringify({ path: "buffer.txt", content: "written" }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { writeTextFile: true } } } as never);
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "write" }] });
+    let close: Promise<unknown> | undefined;
+    let forkedSessionId: string | undefined;
+    try {
+      await started.promise;
+      if (transfer === "close") {
+        await agent.cancel({ sessionId });
+        close = agent.closeSession({ sessionId });
+      } else {
+        close = transfer === "fork"
+          ? agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] })
+          : agent.loadSession({ sessionId, cwd, mcpServers: [] });
+      }
+      let promptSettled = false;
+      let closeSettled = false;
+      void prompt.then(() => { promptSettled = true; });
+      void close.then(() => { closeSettled = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(promptSettled, false);
+      assert.equal(closeSettled, false);
+      assert.ok(!store.load(sessionId)?.messages.some(message => message.role === "tool" && message.tool_call_id === "editor-write"));
+      held.resolve();
+      assert.equal((await prompt).stopReason, "cancelled");
+      const transferred = await close as { sessionId?: string };
+      if (transfer === "fork") forkedSessionId = transferred.sessionId;
+      assert.ok(store.load(sessionId)?.messages.some(message => message.role === "tool" &&
+        message.tool_call_id === "editor-write" && message.content === "File written successfully: buffer.txt"));
+    } finally {
+      held.resolve();
+      await Promise.allSettled([prompt, close]);
+      await agent.closeSession({ sessionId });
+      if (forkedSessionId) await agent.closeSession({ sessionId: forkedSessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 }
 
 test("cancelled delayed vision preprocessing settles without starting the model", async () => {

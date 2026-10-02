@@ -844,6 +844,7 @@ export class GlmAcpAgent implements Agent {
     const predecessor = session.promptPromise;
     session.abortController?.abort();
     const abortController = new AbortController();
+    const promptConnection = this.ownedPromptConnection(ownsPrompt, abortController.signal);
     session.abortController = abortController;
     let resolvePromptPromise!: () => void;
     const promptPromise = new Promise<void>((resolve) => {
@@ -932,7 +933,6 @@ export class GlmAcpAgent implements Agent {
       if (!ownsPrompt()) {
         return cancelledResponse();
       }
-      if (session.abortController === abortController) session.abortController = null;
       session.updatedAt = new Date().toISOString();
 
       // Emit a session_info_update with the (possibly first-set) title and
@@ -949,7 +949,7 @@ export class GlmAcpAgent implements Agent {
             })()
           : {};
 
-      await this.connection.sessionUpdate({
+      await promptConnection.sessionUpdate({
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "session_info_update",
@@ -960,7 +960,9 @@ export class GlmAcpAgent implements Agent {
 
       await this.persistSession(params.sessionId, session);
 
-      const response: PromptResponse = { stopReason };
+      const response: PromptResponse = {
+        stopReason: abortController.signal.aborted || !ownsPrompt() ? "cancelled" : stopReason,
+      };
       if (usage) response.usage = usage;
       if (userMessageId) response.userMessageId = userMessageId;
       return response;
@@ -975,7 +977,7 @@ export class GlmAcpAgent implements Agent {
       // something instead of a silent JSON-RPC error.
       const message = err instanceof Error ? err.message : String(err);
       if (ownsPrompt()) {
-        await safeSessionUpdate(this.connection, {
+        await safeSessionUpdate(promptConnection, {
           sessionId: params.sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -983,6 +985,7 @@ export class GlmAcpAgent implements Agent {
           },
         });
       }
+      if (abortController.signal.aborted || !ownsPrompt()) return cancelledResponse();
       throw err;
     } finally {
       connSignal?.removeEventListener("abort", onConnectionClose);
@@ -1276,6 +1279,9 @@ export class GlmAcpAgent implements Agent {
     const promptDrain = source
       ? this.drainPrompt(params.sessionId, source, lifecycle, lease, record)
       : Promise.resolve(true);
+    // Abort before a queued prompt continuation can start new work under
+    // the snapshotting generation, with its checkpoint owner installed.
+    source?.abortController?.abort();
     const forkAbortController = new AbortController();
     record.restoreAbortController = forkAbortController;
     let deferLeaseRelease = false;
@@ -1288,7 +1294,6 @@ export class GlmAcpAgent implements Agent {
       };
       try {
         if (source) {
-          source.abortController?.abort();
           const drained = await promptDrain;
           if (!drained) {
             deferLeaseRelease = true;
@@ -1462,6 +1467,9 @@ export class GlmAcpAgent implements Agent {
     const promptDrain = original
       ? this.drainPrompt(params.sessionId, original, lifecycle, lease, record)
       : Promise.resolve(true);
+    // Reserve the durable drain before synchronous source cancellation;
+    // already-active operations still settle through that checkpoint owner.
+    original?.abortController?.abort();
     const restoreAbortController = new AbortController();
     record.restoreAbortController = restoreAbortController;
     let deferLeaseRelease = false;
@@ -1477,7 +1485,6 @@ export class GlmAcpAgent implements Agent {
       try {
         let persisted: PersistedSession;
         if (original) {
-          original.abortController?.abort();
           const drained = await promptDrain;
           if (!drained) {
             deferLeaseRelease = true;
@@ -1749,13 +1756,37 @@ export class GlmAcpAgent implements Agent {
       && !session.closed;
   }
 
-  private ownedPromptConnection(ownsPrompt: () => boolean): AgentSideConnection {
+  private ownedPromptConnection(ownsPrompt: () => boolean, signal: AbortSignal): AgentSideConnection {
     const connection = this.connection;
     return new Proxy(connection, {
       get(target, property, receiver) {
         if (property === "sessionUpdate") {
           return async (params: Parameters<AgentSideConnection["sessionUpdate"]>[0]) => {
-            if (ownsPrompt()) await connection.sessionUpdate(params);
+            const update = params.update;
+            // These notifications follow an already-known outcome. Losing
+            // their delivery on cancellation must not turn a completed
+            // side effect into an execution error in canonical history.
+            const terminal = update.sessionUpdate === "session_info_update" ||
+              ((update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+                (update.status === "completed" || update.status === "failed"));
+            if (!ownsPrompt() || (signal.aborted && !terminal)) {
+              if (!terminal) throw new Error("Prompt notification cancelled");
+              return;
+            }
+            try {
+              // A cancelled prompt that still owns the session can settle its
+              // cards. The aborted wait detaches delivery without changing
+              // an already-known result or delaying prompt cancellation.
+              await waitForAbort(connection.sessionUpdate(params), signal, "Prompt notification cancelled");
+              // Delivery can win the race just before cancellation, with the
+              // await continuation still queued. Check the owner again before
+              // allowing another chunk or operation to start.
+              if (!terminal && (!ownsPrompt() || signal.aborted)) {
+                throw new Error("Prompt notification cancelled");
+              }
+            } catch (err) {
+              if (!signal.aborted || !terminal) throw err;
+            }
           };
         }
         const value = Reflect.get(target, property, receiver);
@@ -1931,8 +1962,9 @@ export class GlmAcpAgent implements Agent {
     preservesDrainingHistory: () => boolean,
     processSupervisor: ProcessSupervisor
   ): Promise<{ stopReason: InternalStopReason; usage?: Usage }> {
+    const promptConnection = this.ownedPromptConnection(ownsPrompt, signal);
     const executor = new ToolExecutor(
-      this.ownedPromptConnection(ownsPrompt),
+      promptConnection,
       sessionId,
       this.clientCapabilities,
       signal,
@@ -2017,24 +2049,32 @@ export class GlmAcpAgent implements Agent {
 
           if (chunk.thinking) assistantReasoning += chunk.thinking;
           if (chunk.thinking && this.streamThinking && ownsPrompt()) {
-            await this.connection.sessionUpdate({
+            await promptConnection.sessionUpdate({
               sessionId,
               update: {
                 sessionUpdate: "agent_thought_chunk",
                 content: { type: "text", text: chunk.thinking },
               },
             });
+            if (signal.aborted || !ownsPrompt()) {
+              cancelledDuringStream = true;
+              break;
+            }
           }
 
           if (chunk.text && ownsPrompt()) {
             assistantText += chunk.text;
-            await this.connection.sessionUpdate({
+            await promptConnection.sessionUpdate({
               sessionId,
               update: {
                 sessionUpdate: "agent_message_chunk",
                 content: { type: "text", text: chunk.text },
               },
             });
+            if (signal.aborted || !ownsPrompt()) {
+              cancelledDuringStream = true;
+              break;
+            }
           }
 
           if (chunk.toolCall) {
@@ -2212,17 +2252,24 @@ export class GlmAcpAgent implements Agent {
 
     // Reached MAX_TURNS without resolution. Tell the user why we stopped —
     // without this, hitting the cap is indistinguishable from a normal end.
-    if (!ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
-    await this.connection.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: {
-          type: "text",
-          text: `\n[stopped: reached the ${this.maxTurns}-turn limit — send a message to continue]`,
+    if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
+    try {
+      await promptConnection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: `\n[stopped: reached the ${this.maxTurns}-turn limit — send a message to continue]`,
+          },
         },
-      },
-    });
+      });
+    } catch (err) {
+      // A cancelled notice follows a settled tool turn. Keep its usage and
+      // return through prompt finalization so the completed history is saved.
+      if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
+      throw err;
+    }
     return { stopReason: "max_turn_requests", usage: totalUsage };
   }
 
@@ -2652,7 +2699,12 @@ async function safeSessionUpdate(
 }
 /** Reject the owner immediately while retaining a handler for a late setup result. */
 function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal, message: string): Promise<T> {
-  if (signal.aborted) return Promise.reject(new Error(message));
+  if (signal.aborted) {
+    // Dispatch itself may synchronously abort its owner before this helper
+    // receives the promise. Still own the operation's eventual rejection.
+    void promise.catch(() => undefined);
+    return Promise.reject(new Error(message));
+  }
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const claim = (): boolean => {

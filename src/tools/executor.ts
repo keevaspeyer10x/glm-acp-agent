@@ -212,6 +212,13 @@ type PermissionDecision =
   | { type: "aborted" }
   | { type: "error"; message: string };
 
+/** Only raised at a notification boundary before an operation is dispatched. */
+class ToolCallCancelledBeforeExecutionError extends Error {
+  constructor() {
+    super("Tool call cancelled before execution.");
+  }
+}
+
 export class ToolExecutor {
   constructor(
     private connection: AgentSideConnection,
@@ -272,10 +279,27 @@ export class ToolExecutor {
         await this.failedToolCall(toolCallId, toolName, args, message);
         return { content: message };
       }
-    }} )();
+    }} )().catch(async (cause: unknown): Promise<ToolResult> => {
+      if (!(cause instanceof ToolCallCancelledBeforeExecutionError)) throw cause;
+      await this.markFailed(toolCallId, cause.message);
+      return { content: cause.message };
+    });
     // This is the sole boundary before a result becomes a model-history tool
     // message. Permission arguments and write payloads never cross this path.
     return { content: boundToolResult(result.content, this.resourceLimits.toolResultBytes) };
+  }
+
+  /** An interrupted announcement proves its following operation never started. */
+  private async announceToolCall(
+    params: Parameters<AgentSideConnection["sessionUpdate"]>[0]
+  ): Promise<void> {
+    try {
+      await this.connection.sessionUpdate(params);
+    } catch (cause) {
+      if (!this.signal?.aborted) throw cause;
+      throw new ToolCallCancelledBeforeExecutionError();
+    }
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
   }
 
   // ---------------------------------------------------------------------------
@@ -298,7 +322,7 @@ export class ToolExecutor {
     );
     const absolutePath = this.resolvePath(path);
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -311,6 +335,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const page = await this.readTextPage(absolutePath, offset, limit);
       if (page.eof) {
@@ -455,7 +480,7 @@ export class ToolExecutor {
     const absolutePath = this.resolvePath(path);
 
     // Step 1: announce the pending tool call so the client can show it.
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -467,6 +492,8 @@ export class ToolExecutor {
         rawInput: elideForPreview(args),
       },
     });
+
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
 
     // Step 2: request user permission based on the current session mode. The
     // prompt must show the full payload: an approval decides on exactly what
@@ -489,7 +516,7 @@ export class ToolExecutor {
     }
 
     // Step 3: move to in_progress and execute.
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call_update",
@@ -632,7 +659,7 @@ export class ToolExecutor {
     }
     const absolutePath = this.resolvePath(path);
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -644,6 +671,8 @@ export class ToolExecutor {
         rawInput: elideForPreview(args),
       },
     });
+
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
 
     let current: string;
     try {
@@ -687,7 +716,7 @@ export class ToolExecutor {
       return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
     }
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call_update",
@@ -763,7 +792,7 @@ export class ToolExecutor {
     const path = rawPath.trim();
     const absolutePath = this.resolvePath(path);
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -776,6 +805,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const directory = await opendir(absolutePath);
       const entries: Dirent[] = [];
@@ -841,7 +871,7 @@ export class ToolExecutor {
     }
 
     // Step 1: announce.
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -877,7 +907,7 @@ export class ToolExecutor {
     toolCallId: string,
     command: string
   ): Promise<ToolResult> {
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call_update",
@@ -954,7 +984,7 @@ export class ToolExecutor {
       );
     }
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -967,6 +997,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const apiKey = requireResolvedApiKey();
       const toolArgs: Record<string, unknown> = { query };
@@ -1016,7 +1047,7 @@ export class ToolExecutor {
       );
     }
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -1029,6 +1060,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const apiKey = requireResolvedApiKey();
 
@@ -1084,7 +1116,7 @@ export class ToolExecutor {
       );
     }
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -1097,6 +1129,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const visionArgs: Record<string, unknown> = { image_source: imageSource };
       if (prompt) visionArgs["prompt"] = prompt;
@@ -1126,7 +1159,7 @@ export class ToolExecutor {
     toolName: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -1139,6 +1172,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const mcpResult = await this.sessionMcpTools!.callTool(toolName, args, this.signal);
       const text = unwrapToolText(mcpResult);

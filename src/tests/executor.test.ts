@@ -1384,7 +1384,7 @@ for (const scenario of [
         conn.readTextFileCalls.length,
         readsBeforeDispatch + (scenario.abort ? 0 : 1)
       );
-      assert.match(result.content, scenario.abort ? /cancelled by turn/i : scenario.writes ? /File edited successfully/ : /changed while waiting/);
+      assert.match(result.content, scenario.abort ? /cancelled (?:by turn|before execution)/i : scenario.writes ? /File edited successfully/ : /changed while waiting/);
     } finally {
       release();
       rmSync(dir, { recursive: true, force: true });

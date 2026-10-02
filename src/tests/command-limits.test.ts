@@ -412,6 +412,6 @@ test("a pre-aborted command is rejected without spawning work", async () => {
     "run_command",
     JSON.stringify({ command: "printf should-not-run" })
   );
-  assert.match(result.content, /cancelled by (turn|user)|aborted/i);
+  assert.match(result.content, /cancelled (?:by (?:turn|user)|before execution)|aborted/i);
   assert.equal(lastUpdate(connection).status, "failed");
 });
