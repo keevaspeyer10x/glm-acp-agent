@@ -108,6 +108,123 @@ test("partial text from a dropped stream is kept and the session accepts another
   }
 });
 
+// Larger than the default model's compaction threshold, so the next prompt
+// rewrites the live user message before the provider call.
+const PRIOR_TURN = "prior-turn ".repeat(200_000);
+
+test("a connection error after compaction drops the unsent prompt", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-transport-compact-"));
+  const store = new SessionStore(join(cwd, "sessions"));
+  const notices: string[] = [];
+  let sawCompaction = false;
+  let seeded = false;
+  const agent = new GlmAcpAgent({
+    sessionUpdate: async (update: { update: { sessionUpdate: string; content?: { text?: string } } }) => {
+      const text = update.update.content?.text;
+      if (update.update.sessionUpdate === "agent_message_chunk" && text && !text.startsWith("prior-turn")) {
+        notices.push(text);
+      }
+    },
+  } as never, {
+    sessionStore: store,
+    visionClient: null,
+    glm: {
+      async *streamChat(messages: { role?: string; content?: unknown }[]): AsyncGenerator<GlmStreamChunk> {
+        if (!seeded) {
+          seeded = true;
+          yield { text: PRIOR_TURN };
+          yield { done: true, stopReason: "stop" };
+          return;
+        }
+        sawCompaction = messages.some((message) => message.role === "user" && String(message.content).includes("Context compaction"));
+        throw new OpenAI.APIConnectionError({ message: "Connection error." });
+      },
+    },
+  });
+  const sessionId = (await agent.newSession({ cwd, mcpServers: [] })).sessionId;
+  try {
+    const prior = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "remember the bulk" }],
+    });
+    assert.equal(prior.stopReason, "end_turn");
+    const failed = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "add the missing row" }],
+    });
+    assert.equal(sawCompaction, true);
+    assert.equal(failed.stopReason, "cancelled");
+    assert.match(notices.join("\n"), /Send the message again when you are back online/);
+    const saved = store.load(sessionId);
+    assert.equal(
+      saved?.messages.some((message) => JSON.stringify(message).includes("add the missing row")),
+      false
+    );
+  } finally {
+    await agent.closeSession({ sessionId });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a dropped stream after compaction keeps partial work", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-transport-compact-partial-"));
+  const store = new SessionStore(join(cwd, "sessions"));
+  const notices: string[] = [];
+  let sawCompaction = false;
+  let seeded = false;
+  const agent = new GlmAcpAgent({
+    sessionUpdate: async (update: { update: { sessionUpdate: string; content?: { text?: string } } }) => {
+      const text = update.update.content?.text;
+      if (update.update.sessionUpdate === "agent_message_chunk" && text && !text.startsWith("prior-turn")) {
+        notices.push(text);
+      }
+    },
+  } as never, {
+    sessionStore: store,
+    visionClient: null,
+    glm: {
+      async *streamChat(messages: { role?: string; content?: unknown }[]): AsyncGenerator<GlmStreamChunk> {
+        if (!seeded) {
+          seeded = true;
+          yield { text: PRIOR_TURN };
+          yield { done: true, stopReason: "stop" };
+          return;
+        }
+        sawCompaction = messages.some((message) => message.role === "user" && String(message.content).includes("Context compaction"));
+        yield { text: "partial answer" };
+        throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+      },
+    },
+  });
+  const sessionId = (await agent.newSession({ cwd, mcpServers: [] })).sessionId;
+  try {
+    const prior = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "remember the bulk" }],
+    });
+    assert.equal(prior.stopReason, "end_turn");
+    const failed = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "compare them" }],
+    });
+    assert.equal(sawCompaction, true);
+    assert.equal(failed.stopReason, "cancelled");
+    assert.match(notices.join("\n"), /Send a message to continue/);
+    const saved = store.load(sessionId);
+    assert.equal(
+      saved?.messages.some((message) => message.role === "assistant" && message.content === "partial answer"),
+      true
+    );
+    assert.equal(
+      saved?.messages.some((message) => message.role === "user" && JSON.stringify(message).includes("compare them")),
+      true
+    );
+  } finally {
+    await agent.closeSession({ sessionId });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("an HTTP provider error still fails the prompt", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-transport-http-"));
   const agent = new GlmAcpAgent({ sessionUpdate: async () => {} } as never, {

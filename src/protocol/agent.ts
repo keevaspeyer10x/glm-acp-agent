@@ -973,12 +973,21 @@ export class GlmAcpAgent implements Agent {
       // as cancelled, keep any text that already streamed, and leave the
       // session idle so the next message opens a new connection.
       if (isRecoverableTransportError(err) && userMessage) {
-        const start = session.messages.indexOf(userMessage);
-        const keptWork = start >= 0 && session.messages.slice(start + 1)
+        // Compaction replaces the live user message with a new object before
+        // the provider call, so identity lookup misses the turn that just ran.
+        let start = -1;
+        for (let index = session.messages.length - 1; index >= 0; index--) {
+          if (session.messages[index]?.role === "user") {
+            start = index;
+            break;
+          }
+        }
+        const currentTurn = start >= 0 ? session.messages[start] : undefined;
+        const keptWork = currentTurn !== undefined && session.messages.slice(start + 1)
           .some((message) => message.role === "assistant" || message.role === "tool");
-        if (start >= 0 && !keptWork) {
+        if (currentTurn && !keptWork) {
           session.messages.splice(start, 1);
-          session.displayText.delete(userMessage);
+          session.displayText.delete(currentTurn);
         }
         session.updatedAt = new Date().toISOString();
         await this.persistSession(params.sessionId, session);
