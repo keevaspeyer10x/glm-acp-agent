@@ -406,9 +406,10 @@ test("StdioVisionMcpClient terminates the Windows process tree on dispose", asyn
   const callPromise = client.callTool("image_analysis", { image_source: "x" });
 
   await new Promise((r) => setImmediate(r));
+  const rejected = assert.rejects(callPromise, /client disposed/i);
   await client.dispose();
 
-  await assert.rejects(callPromise, /client disposed/i);
+  await rejected;
   assert.equal(terminatedPid, 4242);
   assert.equal(getKillCount(), 0);
 });

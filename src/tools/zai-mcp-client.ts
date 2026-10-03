@@ -6,7 +6,17 @@ import {
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
 } from "./mcp-pagination.js";
-import { clampMcpHttpErrorBody, readMcpResponseText } from "./mcp-response-limit.js";
+import { clampMcpHttpErrorBody } from "./mcp-response-limit.js";
+import {
+  cancelMcpHttpBody,
+  readMcpHttpResponseText,
+  readMcpHttpJsonRpcResponse,
+  fetchMcpHttp,
+  withMcpHttpDeadline,
+  DEFAULT_MCP_HTTP_INITIALIZATION_TIMEOUT_MS,
+  type McpHttpJsonRpcResponse,
+  type McpHttpTimingOptions,
+} from "./mcp-http-response.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -22,17 +32,6 @@ interface JsonRpcRequest {
   params?: Record<string, unknown>;
 }
 
-interface JsonRpcResponse {
-  jsonrpc?: string;
-  id?: number;
-  result?: unknown;
-  error?: {
-    code?: string | number;
-    message?: string;
-    [key: string]: unknown;
-  };
-}
-
 export interface ZaiMcpToolCall {
   endpoint: string;
   toolName: string;
@@ -41,7 +40,7 @@ export interface ZaiMcpToolCall {
   signal?: AbortSignal;
 }
 
-export interface ZaiMcpClientOptions {
+export interface ZaiMcpClientOptions extends McpHttpTimingOptions {
   maxPages?: number;
   maxTools?: number;
   maxSchemaBytes?: number;
@@ -100,6 +99,15 @@ export class ZaiMcpClient {
     const cached = this.sessions.get(cacheKey);
     if (cached?.initialized) return cached;
 
+    return withMcpHttpDeadline(
+      signal => this.initialize(call, cacheKey, signal),
+      call.signal,
+      this.limits.initializationTimeoutMs ?? DEFAULT_MCP_HTTP_INITIALIZATION_TIMEOUT_MS,
+      "initialization",
+    );
+  }
+
+  private async initialize(call: ZaiMcpToolCall, cacheKey: string, signal: AbortSignal) {
     const initializeResponse = await this.fetchJsonRpc(
       call.endpoint,
       call.apiKey,
@@ -118,7 +126,7 @@ export class ZaiMcpClient {
         },
       },
       "initialize",
-      call.signal
+      signal
     );
 
     const sessionId = initializeResponse.sessionId;
@@ -130,7 +138,7 @@ export class ZaiMcpClient {
         method: "notifications/initialized",
       },
       "notifications/initialized",
-      call.signal,
+      signal,
       sessionId
     );
 
@@ -138,7 +146,7 @@ export class ZaiMcpClient {
       call.endpoint,
       call.apiKey,
       sessionId,
-      call.signal
+      signal
     );
     const session = { sessionId, initialized: true, tools };
     this.sessions.set(cacheKey, session);
@@ -213,16 +221,17 @@ export class ZaiMcpClient {
     signal?: AbortSignal,
     sessionId?: string
   ): Promise<void> {
-    const response = await this.fetchImpl(endpoint, {
+    await fetchMcpHttp(endpoint, {
       method: "POST",
       headers: buildHeaders(apiKey, mcpMethod, sessionId),
       body: JSON.stringify(body),
-      signal,
-    });
-    if (!response.ok) {
-      const text = await readMcpResponseText(response);
-      throw new Error(formatMcpError(mcpMethod, response.status, text));
-    }
+    }, async (response, requestSignal) => {
+      if (!response.ok) {
+        const text = await readMcpHttpResponseText(response, requestSignal, this.limits.bodyIdleTimeoutMs);
+        throw new Error(formatMcpError(mcpMethod, response.status, text));
+      }
+      cancelMcpHttpBody(response);
+    }, signal, this.limits, this.fetchImpl);
   }
 
   private async fetchJsonRpc(
@@ -234,27 +243,27 @@ export class ZaiMcpClient {
     signal?: AbortSignal,
     sessionId?: string,
     mcpName?: string
-  ): Promise<{ body: JsonRpcResponse; sessionId?: string }> {
-    const response = await this.fetchImpl(endpoint, {
+  ): Promise<{ body: McpHttpJsonRpcResponse; sessionId?: string }> {
+    return fetchMcpHttp(endpoint, {
       method: "POST",
       headers: buildHeaders(apiKey, mcpMethod, sessionId, mcpName),
       body: JSON.stringify(body),
-      signal,
-    });
-    const text = await readMcpResponseText(response);
-    if (!response.ok) {
-      throw new Error(formatMcpError(stage, response.status, text));
-    }
+    }, async (response, requestSignal) => {
+      if (!response.ok) {
+        const text = await readMcpHttpResponseText(response, requestSignal, this.limits.bodyIdleTimeoutMs);
+        throw new Error(formatMcpError(stage, response.status, text));
+      }
 
-    const parsed = parseMcpResponse(text, response.headers.get("Content-Type") ?? "");
-    if (parsed.error) {
-      throw new Error(formatJsonRpcError(stage, parsed.error));
-    }
+      const parsed = await readMcpHttpJsonRpcResponse(response, body.id!, requestSignal, this.limits.bodyIdleTimeoutMs);
+      if (parsed.error) {
+        throw new Error(formatJsonRpcError(stage, parsed.error));
+      }
 
-    return {
-      body: parsed,
-      sessionId: response.headers.get("MCP-Session-Id") ?? undefined,
-    };
+      return {
+        body: parsed,
+        sessionId: response.headers.get("MCP-Session-Id") ?? undefined,
+      };
+    }, signal, this.limits, this.fetchImpl);
   }
 }
 
@@ -315,31 +324,6 @@ function buildHeaders(
   return headers;
 }
 
-function parseMcpResponse(text: string, contentType: string): JsonRpcResponse {
-  if (!text.trim()) {
-    throw new Error("MCP response was empty.");
-  }
-  if (contentType.toLowerCase().includes("text/event-stream")) {
-    return parseSseJsonRpc(text);
-  }
-  return JSON.parse(text) as JsonRpcResponse;
-}
-
-function parseSseJsonRpc(text: string): JsonRpcResponse {
-  const dataLines: string[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith("data:")) {
-      dataLines.push(line.slice("data:".length).trimStart());
-    }
-  }
-  for (const data of dataLines) {
-    if (!data || data === "[DONE]") continue;
-    const parsed = JSON.parse(data) as JsonRpcResponse;
-    if (parsed.result !== undefined || parsed.error !== undefined) return parsed;
-  }
-  throw new Error("MCP SSE response did not contain a JSON-RPC result.");
-}
-
 function formatMcpError(stage: string, status: number, body: string): string {
   const shown = clampMcpHttpErrorBody(body);
   if (isCodingPlanEligibilityError(body)) {
@@ -348,7 +332,7 @@ function formatMcpError(stage: string, status: number, body: string): string {
   return `MCP ${stage} failed: HTTP ${status}: ${shown}`;
 }
 
-function formatJsonRpcError(stage: string, error: NonNullable<JsonRpcResponse["error"]>): string {
+function formatJsonRpcError(stage: string, error: NonNullable<McpHttpJsonRpcResponse["error"]>): string {
   const details = JSON.stringify(error);
   if (isCodingPlanEligibilityError(details)) {
     return `MCP ${stage} failed: Coding Plan quota/base URL/tool eligibility likely is not being met (business code 1113). ${clampMcpHttpErrorBody(details)}`;

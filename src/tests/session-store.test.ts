@@ -319,6 +319,57 @@ test("save cleans up its temporary file when replacement fails", async () => {
   }
 });
 
+test("flush reports a failed accepted save even after a later snapshot succeeds", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const failed = validSession({ sessionId: "failed-flush" });
+    mkdirSync(join(dir, `${failed.sessionId}.json`));
+    await assert.rejects(store.save(failed));
+    rmSync(join(dir, `${failed.sessionId}.json`), { recursive: true });
+    await store.save(validSession({ sessionId: failed.sessionId, title: "recovered" }));
+    await assert.rejects(store.flush(), /./);
+    assert.equal(store.load(failed.sessionId)?.title, "recovered");
+    await store.flush();
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("flush drains successful writes before rejecting a concurrently accepted failed write", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    mkdirSync(join(dir, "failed-during-flush.json"));
+    const failed = store.save(validSession({ sessionId: "failed-during-flush" }));
+    const flushing = assert.rejects(store.flush());
+    const successful = store.save(validSession({ sessionId: "saved-during-flush", title: "durable" }));
+    await flushing;
+    assert.equal(store.load("saved-during-flush")?.title, "durable");
+    await assert.rejects(failed);
+    await successful;
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("concurrent flush callers both observe a failed accepted write", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    mkdirSync(join(dir, "shared-failure.json"));
+    const rejectedSave = assert.rejects(store.save(validSession({ sessionId: "shared-failure" })));
+    await Promise.all([
+      assert.rejects(store.flush()),
+      assert.rejects(store.flush()),
+      rejectedSave,
+    ]);
+    await store.flush();
+  } finally {
+    cleanup(dir);
+  }
+});
+
 test("save preserves the prior record when serializing the replacement fails", async () => {
   const dir = makeDir();
   try {

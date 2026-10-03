@@ -86,13 +86,18 @@ test("HTTP idle timeout covers provider next only and retains already yielded te
 test("HTTP idle timeout preserves external abort as cancellation", async () => {
   await withStalledProvider(async client => {
     const controller = new AbortController();
-    const cancel = setTimeout(() => controller.abort(), 20);
+    const stream = client.streamChat([], controller.signal, { model: "glm-5.3", idleTimeoutMs: 200 });
     try {
-      await assert.rejects(async () => {
-        for await (const chunk of client.streamChat([], controller.signal, { model: "glm-5.3", idleTimeoutMs: 200 })) void chunk;
-      }, (error: unknown) => error instanceof Error && error.name === "AbortError");
+      const first = await stream.next();
+      assert.equal(first.value?.text, "partial output");
+      // The request is established before cancellation, so this exercises an
+      // idle provider read regardless of how long HTTP setup took.
+      const pending = stream.next();
+      controller.abort();
+      await assert.rejects(pending, (error: unknown) => error instanceof Error && error.name === "AbortError");
     } finally {
-      clearTimeout(cancel);
+      controller.abort();
+      await stream.return(undefined);
     }
   });
 });

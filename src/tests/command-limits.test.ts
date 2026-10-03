@@ -232,32 +232,91 @@ test("a command timeout terminates the process tree and marks the tool failed", 
 
 test("a normal background shell exit survives a longer deadline", async () => {
   const connection = createConnectionStub();
+  const abortController = new AbortController();
   const cwd = mkdtempSync(join(tmpdir(), "glm-command-limits-background-deadline-"));
+  const ready = join(cwd, "background-ready");
+  const foregroundReady = join(cwd, "foreground-ready");
+  const release = join(cwd, "release");
+  const fire = join(cwd, "fire");
   const marker = join(cwd, "background-finished");
   writeFileSync(
     join(cwd, "background-fixture.cjs"),
-    'setTimeout(() => require("node:fs").writeFileSync("background-finished", "done"), 1100);\n',
+    'const fs = require("node:fs");\n' +
+      'fs.writeFileSync("background-ready", "ready");\n' +
+      'const waiting = setInterval(() => {\n' +
+      '  if (fs.existsSync("fire")) {\n' +
+      '    clearInterval(waiting); fs.writeFileSync("background-finished", "done");\n' +
+      '  }\n' +
+      '}, 1);\n',
     "utf8"
   );
+  writeFileSync(
+    join(cwd, "foreground-fixture.cjs"),
+    'const fs = require("node:fs");\n' +
+      'fs.writeFileSync("foreground-ready", "ready");\n' +
+      'const waiting = setInterval(() => {\n' +
+      '  if (fs.existsSync("release")) { clearInterval(waiting); process.exit(0); }\n' +
+      '}, 1);\n',
+    "utf8"
+  );
+  mock.timers.enable({ apis: ["setTimeout"] });
+  let shellExitResolve!: () => void;
+  const shellExitEvent = new Promise<void>(resolve => { shellExitResolve = resolve; });
+  const originalSpawn = childProcess.spawn;
+  const spawnMock = mock.method(
+    childProcess,
+    "spawn",
+    ((...args: Parameters<typeof originalSpawn>) => {
+      const child = originalSpawn(...args);
+      if (args[0] === "sh") child.once("exit", shellExitResolve);
+      return child;
+    }) as typeof childProcess.spawn
+  );
+  syncBuiltinESMExports();
+  let pendingCleanup: Promise<unknown> | null = null;
   try {
-    const result = await withEnv(
+    const pending = withEnv(
       {
         ACP_GLM_COMMAND_TIMEOUT_MS: "10000",
         ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES: "1024",
       },
       () =>
-        commandExecutor(connection, cwd).execute(
+        commandExecutor(connection, cwd, abortController.signal).execute(
           "tc1",
           "run_command",
           JSON.stringify({
-            command: "node background-fixture.cjs & echo started",
+            command: "node background-fixture.cjs & node foreground-fixture.cjs",
           })
         )
     );
+    pendingCleanup = pending;
+    // Both processes must be ready before the shell may exit. Shell completion
+    // alone says nothing about when a background Node process finished startup.
+    assert.equal(await waitForFile(ready, 5_000), true, "background fixture did not start");
+    assert.equal(await waitForFile(foregroundReady, 5_000), true, "foreground fixture did not start");
+    writeFileSync(release, "release");
+    assert.equal(await settlesWithinRealTime(shellExitEvent, 5_000), true, "shell did not exit normally");
+    // Cross the actual configured deadline after normal shell exit. The
+    // background process keeps inherited pipes open until we release it below.
+    mock.timers.tick(10_000);
+    assert.equal(await settlesWithinRealTime(pending, 5_000), true, "shell completion did not settle");
+    const result = await pending;
     assert.match(result.content, /Exit code: 0/);
+    assert.doesNotMatch(result.content, /timed out/i);
+    assert.equal(existsSync(marker), false);
+    writeFileSync(fire, "fire");
     assert.equal(await waitForFile(marker, 2_500), true);
     assert.equal(lastUpdate(connection).status, "completed");
   } finally {
+    // Release both real fixtures even when an assertion fails before exit.
+    writeFileSync(release, "cleanup");
+    writeFileSync(fire, "cleanup");
+    abortController.abort();
+    mock.timers.tick(250);
+    spawnMock.mock.restore();
+    syncBuiltinESMExports();
+    mock.timers.reset();
+    await pendingCleanup?.catch(() => undefined);
     await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
@@ -353,6 +412,6 @@ test("a pre-aborted command is rejected without spawning work", async () => {
     "run_command",
     JSON.stringify({ command: "printf should-not-run" })
   );
-  assert.match(result.content, /cancelled by (turn|user)|aborted/i);
+  assert.match(result.content, /cancelled (?:by (?:turn|user)|before execution)|aborted/i);
   assert.equal(lastUpdate(connection).status, "failed");
 });

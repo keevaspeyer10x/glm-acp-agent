@@ -173,6 +173,28 @@ test("compaction updates one note instead of appending another", () => {
   assert.match(String(twice.content), /omitted 3 completed exchanges/);
 });
 
+test("repeated multimodal compaction accumulates omissions and preserves user parts", () => {
+  const source: GlmMessage = {
+    role: "user",
+    content: [
+      { type: "text", text: "Describe this image." },
+      { type: "image_url", image_url: { url: "https://example.com/image.png" } },
+      { type: "text", text: "Keep the original instructions." },
+    ],
+  };
+  const original = structuredClone(source);
+  const once = appendCompactionNote(source, 2, 1);
+  const twice = appendCompactionNote(once, 1, 1);
+
+  assert.ok(Array.isArray(original.content));
+  assert.ok(Array.isArray(twice.content));
+  assert.deepEqual(twice.content, [
+    ...original.content,
+    { type: "text", text: "[Context compaction: omitted 3 completed exchanges; shortened 2 tool results. The original user request remains above.]" },
+  ]);
+  assert.deepEqual(source, original, "the original message is not mutated");
+});
+
 test("compaction evicts old complete tool batches within one live user turn", () => {
   const messages: GlmMessage[] = [{ role: "system", content: "rules" }, { role: "user", content: "current" }];
   for (const id of ["old", "new"]) {

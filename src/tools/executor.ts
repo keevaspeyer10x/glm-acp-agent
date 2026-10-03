@@ -69,6 +69,19 @@ const PREVIEW_WALK_BUDGET_BYTES = 262_144;
 /** Marker charged into objects/arrays when the walk budget is exhausted mid-container. */
 const PREVIEW_ELIDED_KEY = "[elided]";
 
+/** Count non-overlapping literal matches; snippet must be non-empty. */
+function countNonOverlappingMatches(text: string, snippet: string): number {
+  let count = 0;
+  for (
+    let index = text.indexOf(snippet);
+    index !== -1;
+    index = text.indexOf(snippet, index + snippet.length)
+  ) {
+    count += 1;
+  }
+  return count;
+}
+
 /** Format a bounded listing while measuring each candidate line only once. */
 export function formatDirectoryListing(
   header: string,
@@ -199,6 +212,13 @@ type PermissionDecision =
   | { type: "aborted" }
   | { type: "error"; message: string };
 
+/** Only raised at a notification boundary before an operation is dispatched. */
+class ToolCallCancelledBeforeExecutionError extends Error {
+  constructor() {
+    super("Tool call cancelled before execution.");
+  }
+}
+
 export class ToolExecutor {
   constructor(
     private connection: AgentSideConnection,
@@ -259,10 +279,27 @@ export class ToolExecutor {
         await this.failedToolCall(toolCallId, toolName, args, message);
         return { content: message };
       }
-    }} )();
+    }} )().catch(async (cause: unknown): Promise<ToolResult> => {
+      if (!(cause instanceof ToolCallCancelledBeforeExecutionError)) throw cause;
+      await this.markFailed(toolCallId, cause.message);
+      return { content: cause.message };
+    });
     // This is the sole boundary before a result becomes a model-history tool
     // message. Permission arguments and write payloads never cross this path.
     return { content: boundToolResult(result.content, this.resourceLimits.toolResultBytes) };
+  }
+
+  /** An interrupted announcement proves its following operation never started. */
+  private async announceToolCall(
+    params: Parameters<AgentSideConnection["sessionUpdate"]>[0]
+  ): Promise<void> {
+    try {
+      await this.connection.sessionUpdate(params);
+    } catch (cause) {
+      if (!this.signal?.aborted) throw cause;
+      throw new ToolCallCancelledBeforeExecutionError();
+    }
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
   }
 
   // ---------------------------------------------------------------------------
@@ -285,7 +322,7 @@ export class ToolExecutor {
     );
     const absolutePath = this.resolvePath(path);
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -298,6 +335,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const page = await this.readTextPage(absolutePath, offset, limit);
       if (page.eof) {
@@ -442,7 +480,7 @@ export class ToolExecutor {
     const absolutePath = this.resolvePath(path);
 
     // Step 1: announce the pending tool call so the client can show it.
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -454,6 +492,8 @@ export class ToolExecutor {
         rawInput: elideForPreview(args),
       },
     });
+
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
 
     // Step 2: request user permission based on the current session mode. The
     // prompt must show the full payload: an approval decides on exactly what
@@ -472,12 +512,11 @@ export class ToolExecutor {
       return this.permissionDenialResult(toolCallId, "Write", permissionResult);
     }
     if (this.signal?.aborted) {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Write cancelled by turn." };
+      return this.cancelledEditOutcome(toolCallId, "Write cancelled by turn.");
     }
 
     // Step 3: move to in_progress and execute.
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call_update",
@@ -488,8 +527,7 @@ export class ToolExecutor {
 
     try {
       if (this.signal?.aborted) {
-        await this.markFailed(toolCallId, "Cancelled by turn.");
-        return { content: "Write cancelled by turn." };
+        return this.cancelledEditOutcome(toolCallId, "Write cancelled by turn.");
       }
       await this.performWrite(absolutePath, content);
 
@@ -556,6 +594,9 @@ export class ToolExecutor {
         const response = await this.connection.readTextFile({
           sessionId: this.sessionId, path, line, limit: pageLimit,
         } as never);
+        if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
+          throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
+        }
         const lines = response.content.split("\n");
         if (lines.length > 0 && lines.at(-1) === "") lines.pop();
         return lines;
@@ -618,7 +659,7 @@ export class ToolExecutor {
     }
     const absolutePath = this.resolvePath(path);
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -631,6 +672,8 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
+
     let current: string;
     try {
       current = await this.performRead(absolutePath);
@@ -640,7 +683,7 @@ export class ToolExecutor {
       return { content: `Error editing file: cannot read ${path}: ${message}` };
     }
 
-    const occurrences = current.split(oldText).length - 1;
+    const occurrences = countNonOverlappingMatches(current, oldText);
     if (occurrences === 0) {
       await this.markFailed(toolCallId, "old_text not found in file");
       return {
@@ -670,13 +713,25 @@ export class ToolExecutor {
       return this.permissionDenialResult(toolCallId, "Edit", permissionResult);
     }
     if (this.signal?.aborted) {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Edit cancelled by turn." };
+      return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
     }
 
-    // The permission prompt can sit in front of the user for a while; re-read
-    // and re-validate so a buffer edited while deciding is not silently
-    // overwritten by this stale snapshot.
+    await this.announceToolCall({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "in_progress",
+      },
+    });
+    if (this.signal?.aborted) {
+      return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
+    }
+
+    // Both permission and progress delivery can wait on the client. Re-read
+    // after those waits so the edit includes changes already in the buffer.
+    // ACP writes replace the whole buffer without a version precondition;
+    // this remains an optimistic read/write, not an atomic compare-and-swap.
     let latest: string;
     try {
       latest = await this.performRead(absolutePath);
@@ -685,31 +740,21 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, message);
       return { content: `Error editing file: cannot re-read ${path}: ${message}` };
     }
-    const latestOccurrences = latest.split(oldText).length - 1;
+    const latestOccurrences = countNonOverlappingMatches(latest, oldText);
     if (latestOccurrences !== 1) {
       const reason =
         latestOccurrences === 0
           ? "`old_text` is no longer present"
           : `\`old_text\` now occurs ${latestOccurrences} times`;
-      await this.markFailed(toolCallId, `file changed while waiting for permission (${reason})`);
+      await this.markFailed(toolCallId, `file changed while waiting for permission or progress delivery (${reason})`);
       return {
-        content: `Error editing file: ${path} changed while waiting for permission (${reason}). Re-read the file and retry.`,
+        content: `Error editing file: ${path} changed while waiting for permission or progress delivery (${reason}). Re-read the file and retry.`,
       };
     }
 
-    await this.connection.sessionUpdate({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "tool_call_update",
-        toolCallId,
-        status: "in_progress",
-      },
-    });
-
     try {
       if (this.signal?.aborted) {
-        await this.markFailed(toolCallId, "Cancelled by turn.");
-        return { content: "Edit cancelled by turn." };
+        return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
       }
       await this.performWrite(absolutePath, latest.replace(oldText, () => newText));
 
@@ -747,7 +792,7 @@ export class ToolExecutor {
     const path = rawPath.trim();
     const absolutePath = this.resolvePath(path);
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -760,6 +805,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const directory = await opendir(absolutePath);
       const entries: Dirent[] = [];
@@ -825,7 +871,7 @@ export class ToolExecutor {
     }
 
     // Step 1: announce.
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -861,7 +907,7 @@ export class ToolExecutor {
     toolCallId: string,
     command: string
   ): Promise<ToolResult> {
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call_update",
@@ -938,7 +984,7 @@ export class ToolExecutor {
       );
     }
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -951,6 +997,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const apiKey = requireResolvedApiKey();
       const toolArgs: Record<string, unknown> = { query };
@@ -1000,7 +1047,7 @@ export class ToolExecutor {
       );
     }
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -1013,6 +1060,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const apiKey = requireResolvedApiKey();
 
@@ -1068,7 +1116,7 @@ export class ToolExecutor {
       );
     }
 
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -1081,6 +1129,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const visionArgs: Record<string, unknown> = { image_source: imageSource };
       if (prompt) visionArgs["prompt"] = prompt;
@@ -1110,7 +1159,7 @@ export class ToolExecutor {
     toolName: string,
     args: Record<string, unknown>
   ): Promise<ToolResult> {
-    await this.connection.sessionUpdate({
+    await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -1123,6 +1172,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const mcpResult = await this.sessionMcpTools!.callTool(toolName, args, this.signal);
       const text = unwrapToolText(mcpResult);
@@ -1279,6 +1329,16 @@ export class ToolExecutor {
         rawOutput: elideForPreview({ error: message }),
       },
     });
+  }
+
+  /**
+   * Shared abort outcome for write_file and edit_file: mark the call failed
+   * and return the cancelled result. Callers still gate on
+   * `this.signal?.aborted` so the check itself stays inline.
+   */
+  private async cancelledEditOutcome(toolCallId: string, content: string): Promise<ToolResult> {
+    await this.markFailed(toolCallId, "Cancelled by turn.");
+    return { content };
   }
 
   /**

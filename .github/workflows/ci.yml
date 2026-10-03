@@ -44,7 +44,7 @@ jobs:
         run: npm run build
 
       - name: Test
-        run: npm test
+        run: npm run test:only
 
       - name: Check registry manifest version sync
         run: node dist/registry/sync-manifest.js --check

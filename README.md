@@ -97,13 +97,15 @@ The agent does not run tools inside an OS or container sandbox. Shell commands a
 |------|---------|---------------------|-------------|
 | `read_file` | ACP client when both fs read/write capabilities are advertised, otherwise agent process | Always silent | Read a text file or editor buffer, paginated by offset/limit (default 2000 lines, capped at 5000). Local scans are byte-bounded; totals can be unknown and an incomplete line is never given a next offset. |
 | `write_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Write or overwrite a text file. Silent in `accept_edits` and `bypass_permissions`. |
-| `edit_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Replace one exact, unique snippet in an existing file. It refuses an input or editor buffer over the read/edit budget, and re-validates after permission so concurrent edits are not overwritten. Silent in `accept_edits` and `bypass_permissions`. |
+| `edit_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Replace one exact, unique snippet in an existing file. It refuses an input or editor buffer over the read/edit budget, and re-validates after permission and progress notification delivery to preserve changes present at the final read. Silent in `accept_edits` and `bypass_permissions`. |
 | `todowrite` | Agent process | Always silent | Create or replace the session's structured task list so multi-step progress is tracked instead of narrated in chat. Each call replaces the list; the tool result renders it back to the model. |
 | `list_files` | Agent process | Always silent | List a directory through a bounded iterator; a truncated result is a disclosed subset. |
 | `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command; cancelling a turn terminates its shell process group, while intentionally backgrounded processes survive a normal shell exit. Silent only in `bypass_permissions`. |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | Always silent | Search the web — returns titles, URLs, and summaries |
 | `web_reader` | Agent (Z.AI Coding Plan MCP) | Always silent | Fetch and parse a web page (markdown or plain text) |
 | `image_analysis` | Agent (Z.AI Vision MCP, stdio) | Always silent | Analyze a local image path or remote URL using `@z_ai/mcp-server` |
+
+Editor edits use an optimistic read followed by a full-buffer write. ACP's `fs/write_text_file` request has no version precondition, so edits made during that write RPC can still race with the replacement. The final read preserves unrelated changes already present and rejects a target snippet that has disappeared or become ambiguous.
 
 ### Session Modes
 

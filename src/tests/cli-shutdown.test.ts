@@ -21,6 +21,7 @@ function shellQuote(value: string): string {
 }
 
 async function startMockLlm(command: string) {
+  let commandSent = false;
   const server = createServer((req, res) => {
     req.resume();
     req.on("end", () => {
@@ -29,16 +30,17 @@ async function startMockLlm(command: string) {
         id: "mock",
         object: "chat.completion.chunk",
         choices: [{
-          delta: {
+          delta: commandSent ? { content: "done" } : {
             tool_calls: [{
               index: 0,
               id: "tool-1",
               function: { name: "run_command", arguments: JSON.stringify({ command }) },
             }],
           },
-          finish_reason: "tool_calls",
+          finish_reason: commandSent ? "stop" : "tool_calls",
         }],
       };
+      commandSent = true;
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       res.end("data: [DONE]\n\n");
     });
@@ -50,7 +52,7 @@ async function startMockLlm(command: string) {
   return { server, baseUrl: `http://127.0.0.1:${address.port}/v1` };
 }
 
-async function runCliUntilCommand(command: string, cwd: string): Promise<{ child: ChildProcess; started: Promise<void>; close: () => void; closeServer: () => void }> {
+async function runCliUntilCommand(command: string, cwd: string): Promise<{ child: ChildProcess; started: Promise<void>; completed: Promise<void>; close: () => void; closeServer: () => void }> {
   const { server, baseUrl } = await startMockLlm(command);
   const child = spawn(process.execPath, [AGENT_ENTRY], {
     cwd,
@@ -64,9 +66,17 @@ async function runCliUntilCommand(command: string, cwd: string): Promise<{ child
   });
   let resolveStarted!: () => void;
   const started = new Promise<void>((resolve) => { resolveStarted = resolve; });
+  let resolveCompleted!: () => void;
+  const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
+  let firstToolCallId: string | undefined;
   const client = {
-    async sessionUpdate({ update }: { update: { sessionUpdate?: string; status?: string } }) {
-      if (update.sessionUpdate === "tool_call_update" && update.status === "in_progress") resolveStarted();
+    async sessionUpdate({ update }: { update: { sessionUpdate?: string; status?: string; toolCallId?: string } }) {
+      if (update.sessionUpdate !== "tool_call_update") return;
+      if (update.status === "in_progress") {
+        firstToolCallId ??= update.toolCallId;
+        resolveStarted();
+      }
+      if (firstToolCallId !== undefined && update.toolCallId === firstToolCallId && update.status === "completed") resolveCompleted();
     },
     async requestPermission() {
       return { outcome: { outcome: "selected", optionId: "allow" } };
@@ -86,6 +96,7 @@ async function runCliUntilCommand(command: string, cwd: string): Promise<{ child
   return {
     child,
     started,
+    completed,
     close: () => {
       child.stdin?.end();
       server.close();
@@ -245,16 +256,17 @@ test("CLI shutdown preserves intentionally backgrounded commands after normal sh
   const marker = join(cwd, "marker");
   const pending = join(cwd, "pending");
   // Reveal the marker only after its write closes; otherwise teardown can race the background writer.
+  // The mock issues one command, so this rename accounts for its only detached writer.
   const code = [
     'const fs=require("node:fs");',
     `setTimeout(()=>{fs.writeFileSync(${JSON.stringify(pending)}, "done");`,
     `fs.renameSync(${JSON.stringify(pending)}, ${JSON.stringify(marker)});}, 300);`,
   ].join("");
   const command = `${shellQuote(process.execPath)} -e ${shellQuote(code)} >/dev/null 2>&1 & echo started`;
-  const { child, started, close } = await runCliUntilCommand(command, cwd);
+  const { child, completed, close } = await runCliUntilCommand(command, cwd);
   try {
-    await started;
-    await wait(100);
+    // in_progress precedes dispatch; completed confirms the foreground shell exited.
+    await completed;
     close();
     const [exitCode] = await once(child, "exit");
     assert.equal(exitCode, 0);

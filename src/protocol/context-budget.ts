@@ -167,7 +167,11 @@ export function compactToBudget(
 
 export function appendCompactionNote(message: GlmMessage, removed: number, reduced: number): GlmMessage {
   const pattern = /\n?\n?\[Context compaction: omitted (\d+) completed exchanges?; shortened (\d+) tool results?\. The original user request remains above\.\]/;
-  const previous = typeof message.content === "string" ? message.content.match(pattern) : undefined;
+  const previous = typeof message.content === "string"
+    ? message.content.match(pattern)
+    : Array.isArray(message.content)
+      ? message.content.map(part => part.type === "text" ? part.text.match(pattern) : null).find(match => match !== null)
+      : undefined;
   const totalRemoved = removed + Number(previous?.[1] ?? 0);
   const totalReduced = reduced + Number(previous?.[2] ?? 0);
   const note = `[Context compaction: omitted ${totalRemoved} completed exchange${totalRemoved === 1 ? "" : "s"}; shortened ${totalReduced} tool result${totalReduced === 1 ? "" : "s"}. The original user request remains above.]`;

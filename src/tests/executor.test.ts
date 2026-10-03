@@ -26,6 +26,12 @@ function createConnectionStub(opts: {
   terminalOutput?: string;
   /** When set, client readTextFile returns this instead of the on-disk content (simulates a dirty buffer). */
   clientFileContent?: string;
+  /**
+   * Live editor buffer: when set, every client readTextFile serves this
+   * object's current `content` (NOT disk), so tests can mutate the unsaved
+   * buffer independently of the file on disk.
+   */
+  clientBuffer?: { content: string };
   /** Called when a permission request arrives — use it to mutate files mid-prompt. */
   onPermission?: () => void;
 } = {}) {
@@ -47,6 +53,7 @@ function createConnectionStub(opts: {
     async readTextFile(params: { sessionId: string; path: string }) {
       if (opts.readError) throw new Error("file not found");
       readTextFileCalls.push(params);
+      if (opts.clientBuffer) return { content: opts.clientBuffer.content };
       if (opts.clientFileContent !== undefined) return { content: opts.clientFileContent };
       // Mirror a real client: readTextFile serves the file's current on-disk contents.
       return { content: readFileSync(params.path, "utf8") };
@@ -179,7 +186,9 @@ function jsonResponse(
   return new Response(JSON.stringify(body), { ...init, headers });
 }
 
-function createFetchStub(responses: Response[]) {
+type FetchResponse = Response | ((request: Record<string, unknown>) => Response);
+
+function createFetchStub(responses: FetchResponse[]) {
   const calls: FetchCall[] = [];
   const fetchStub = async (url: string | URL | Request, init?: RequestInit) => {
     assert.ok(init, "fetch init is required");
@@ -189,7 +198,7 @@ function createFetchStub(responses: Response[]) {
     calls.push({ url: String(url), init, body, headers });
     const response = responses.shift();
     assert.ok(response, "unexpected fetch call");
-    return response;
+    return typeof response === "function" ? response(body) : response;
   };
   return { calls, fetchStub };
 }
@@ -213,7 +222,7 @@ async function withStoredApiKey<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function withMockedFetch<T>(
-  responses: Response[],
+  responses: FetchResponse[],
   fn: (calls: FetchCall[]) => Promise<T>
 ): Promise<T> {
   const oldFetch = globalThis.fetch;
@@ -473,6 +482,74 @@ test("read_file treats editor line pagination as pagination, not byte truncation
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+for (const legacy of [false, true]) {
+  test(`read_file rejects an oversized ${legacy ? "legacy full buffer" : "conforming editor long line"} before returning it`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-editor-byte-limit-"));
+    const path = join(dir, "buffer.txt");
+    writeFileSync(path, "on disk");
+    const updates: Array<{ update: { status?: string } }> = [];
+    const conn = {
+      async sessionUpdate(payload: { update: { status?: string } }) { updates.push(payload); },
+      async readTextFile(params: { line?: number; limit?: number }) {
+        const content = legacy ? "a\nb\nc\nd\ne\nf\ng\nh\ni" : "🙂".repeat(512);
+        return { content: legacy || params.line === 1 ? content : "" };
+      },
+    };
+    const limits: ResourceLimits = {
+      toolResultBytes: 262_144, fileReadBytes: 16, listEntries: 2000, listBytes: 262_144,
+      fsConcurrency: 16,
+    };
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "default", () => undefined, limits);
+    try {
+      const result = await exec.execute("tc1", "read_file", JSON.stringify({ path, limit: 1 }));
+      assert.match(result.content, /editor buffer exceeds the 16-byte read\/edit limit/);
+      assert.doesNotMatch(result.content, /🙂|pass offset=/);
+      assert.equal(updates.at(-1)?.update.status, "failed");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("read_file checks the byte budget on the legacy EOF probe too", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-editor-probe-byte-limit-"));
+  const path = join(dir, "buffer.txt");
+  writeFileSync(path, "on disk");
+  const conn = {
+    async sessionUpdate() {},
+    async readTextFile(params: { line?: number; limit?: number }) {
+      return { content: params.line === 2 ? "short" : "x".repeat(2048) };
+    },
+  };
+  const limits: ResourceLimits = {
+    toolResultBytes: 262_144, fileReadBytes: 16, listEntries: 2000, listBytes: 262_144,
+    fsConcurrency: 16,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path, offset: 2, limit: 1 }));
+    assert.match(result.content, /editor buffer exceeds the 16-byte read\/edit limit/);
+    assert.doesNotMatch(result.content, /showing lines|pass offset=/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("read_file accepts editor pages exactly at their UTF-8 byte budget", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-editor-exact-byte-limit-"));
+  const path = join(dir, "buffer.txt");
+  writeFileSync(path, "on disk");
+  const conn = {
+    async sessionUpdate() {},
+    async readTextFile() { return { content: "🙂🙂🙂🙂" }; },
+  };
+  const limits: ResourceLimits = {
+    toolResultBytes: 262_144, fileReadBytes: 16, listEntries: 2000, listBytes: 262_144,
+    fsConcurrency: 16,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path, limit: 1 }));
+    assert.equal(result.content, "🙂🙂🙂🙂");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("read_file renders EOF for a conforming editor at a short or empty offset", async () => {
@@ -935,6 +1012,58 @@ test("edit_file replaces a unique blank-line snippet through the permission flow
   }
 });
 
+for (const scenario of [
+  { name: "overlapping snippets", content: "ababa", oldText: "aba", expected: "changedba" },
+  { name: "overlapping astral text", content: "🙂🙂🙂", oldText: "🙂🙂", expected: "changed🙂" },
+  { name: "a literal UTF-16 surrogate", content: "🙂", oldText: "\ud83d", expected: "changed\ude42" },
+]) {
+  test(`edit_file counts non-overlapping literal matches for ${scenario.name}`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-overlap-"));
+    const path = join(dir, "code.txt");
+    writeFileSync(path, scenario.content, "utf8");
+    const conn = createConnectionStub();
+    const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    try {
+      const result = await executor.execute(
+        "tc1",
+        "edit_file",
+        JSON.stringify({ path, old_text: scenario.oldText, new_text: "changed" })
+      );
+      assert.match(result.content, /edited successfully/);
+      assert.deepEqual(conn.writeTextFileCalls.map(call => call.content), [scenario.expected]);
+      assert.equal(conn.permissionRequests.length, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const afterPermission of [false, true]) {
+  test(`edit_file reports the full non-overlapping ambiguity count ${afterPermission ? "after" : "before"} permission`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-overlap-ambiguous-"));
+    const path = join(dir, "code.txt");
+    const ambiguous = "🙂🙂🙂🙂🙂🙂🙂";
+    writeFileSync(path, afterPermission ? "🙂🙂" : ambiguous, "utf8");
+    const conn = createConnectionStub({
+      onPermission: () => writeFileSync(path, ambiguous, "utf8"),
+    });
+    const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    try {
+      const result = await executor.execute(
+        "tc1",
+        "edit_file",
+        JSON.stringify({ path, old_text: "🙂🙂", new_text: "changed" })
+      );
+      assert.match(result.content, afterPermission ? /now occurs 3 times/ : /occurs 3 times/);
+      assert.equal(readFileSync(path, "utf8"), ambiguous);
+      assert.equal(conn.writeTextFileCalls.length, 0);
+      assert.equal(conn.permissionRequests.length, afterPermission ? 1 : 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test("edit_file inserts replacement text literally when it contains replace tokens", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-literal-"));
   const path = join(dir, "code.txt");
@@ -1200,7 +1329,7 @@ test("edit_file re-validates after the permission prompt and refuses a file chan
       "edit_file",
       JSON.stringify({ path, old_text: "old snippet", new_text: "new snippet" })
     );
-    assert.match(result.content, /changed while waiting for permission/);
+    assert.match(result.content, /changed while waiting for permission or progress delivery/);
     // The user's concurrent edit is intact and nothing was written back.
     assert.equal(readFileSync(path, "utf8"), "keep\nuser rewrote this\n");
     assert.equal(conn.writeTextFileCalls.length, 0);
@@ -1210,6 +1339,125 @@ test("edit_file re-validates after the permission prompt and refuses a file chan
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const scenario of [
+  { name: "preserves unrelated changes", concurrent: "user changed this\nold snippet\n", expected: "user changed this\nnew snippet\n", writes: 1 },
+  { name: "refuses a changed target", concurrent: "keep\nuser rewrote this\n", expected: "keep\nuser rewrote this\n", writes: 0 },
+  { name: "refuses a newly ambiguous target", concurrent: "old snippet\nold snippet\n", expected: "old snippet\nold snippet\n", writes: 0 },
+  { name: "cancels before dispatch", concurrent: "keep\nold snippet\n", expected: "keep\nold snippet\n", writes: 0, abort: true },
+]) {
+  test(`edit_file ${scenario.name} while the in_progress notification is pending`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-notification-"));
+    const path = join(dir, "code.txt");
+    writeFileSync(path, "keep\nold snippet\n", "utf8");
+    const conn = createConnectionStub();
+    let entered!: () => void;
+    const notificationEntered = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const notificationReleased = new Promise<void>(resolve => { release = resolve; });
+    const sessionUpdate = conn.sessionUpdate.bind(conn);
+    conn.sessionUpdate = async payload => {
+      await sessionUpdate(payload);
+      const update = payload["update"] as { status?: string };
+      if (update.status === "in_progress") {
+        entered();
+        await notificationReleased;
+      }
+    };
+    const controller = new AbortController();
+    const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, controller.signal);
+    try {
+      const editing = executor.execute("tc1", "edit_file", JSON.stringify({ path, old_text: "old snippet", new_text: "new snippet" }));
+      await notificationEntered;
+      writeFileSync(path, scenario.concurrent, "utf8");
+      if (scenario.abort) controller.abort();
+      // Reads dispatched before the held notification is released (the initial
+      // buffer read). Once the turn is aborted, the cancellation check must
+      // skip the post-notification re-read entirely, so this count may only
+      // grow while the turn is still alive.
+      const readsBeforeDispatch = conn.readTextFileCalls.length;
+      release();
+      const result = await editing;
+      assert.equal(readFileSync(path, "utf8"), scenario.expected);
+      assert.equal(conn.writeTextFileCalls.length, scenario.writes);
+      assert.equal(
+        conn.readTextFileCalls.length,
+        readsBeforeDispatch + (scenario.abort ? 0 : 1)
+      );
+      assert.match(result.content, scenario.abort ? /cancelled (?:by turn|before execution)/i : scenario.writes ? /File edited successfully/ : /changed while waiting/);
+    } finally {
+      release();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+// The family above mutates the file on disk while the stub reads disk, so it
+// cannot catch a regression that re-reads disk instead of the client's editor
+// buffer during the post-notification revalidation. Here the client serves an
+// independently mutable in-memory buffer while disk stays stale: the edit must
+// be computed against the buffer the user actually sees.
+for (const scenario of [
+  {
+    name: "preserves an unrelated unsaved buffer change",
+    concurrent: "keep\nuser tweaked this\nold snippet\n",
+    expected: "keep\nuser tweaked this\nnew snippet\n",
+    diskAfter: "keep\nuser tweaked this\nnew snippet\n",
+    writes: 1,
+  },
+  {
+    name: "refuses an unsaved buffer rewrite of the target",
+    concurrent: "keep\nuser rewrote this\n",
+    expected: "keep\nuser rewrote this\n",
+    diskAfter: "keep\nold snippet\n",
+    writes: 0,
+  },
+]) {
+  test(`edit_file ${scenario.name} while the in_progress notification is pending`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-buffer-"));
+    const path = join(dir, "code.txt");
+    // Disk keeps the original contents for the whole test; only the client's
+    // unsaved buffer changes while the notification is held.
+    writeFileSync(path, "keep\nold snippet\n", "utf8");
+    const buffer = { content: "keep\nold snippet\n" };
+    const conn = createConnectionStub({ clientBuffer: buffer });
+    let entered!: () => void;
+    const notificationEntered = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const notificationReleased = new Promise<void>(resolve => { release = resolve; });
+    const sessionUpdate = conn.sessionUpdate.bind(conn);
+    conn.sessionUpdate = async payload => {
+      await sessionUpdate(payload);
+      const update = payload["update"] as { status?: string };
+      if (update.status === "in_progress") {
+        entered();
+        await notificationReleased;
+      }
+    };
+    const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    try {
+      const editing = executor.execute("tc1", "edit_file", JSON.stringify({ path, old_text: "old snippet", new_text: "new snippet" }));
+      await notificationEntered;
+      // Mutate ONLY the unsaved editor buffer; disk stays at "keep\nold snippet\n".
+      buffer.content = scenario.concurrent;
+      const readsBeforeDispatch = conn.readTextFileCalls.length;
+      release();
+      const result = await editing;
+      // The post-notification re-read must serve the client buffer, so the
+      // delivered edit carries the user's unsaved change instead of stale disk.
+      assert.equal(conn.writeTextFileCalls.length, scenario.writes);
+      if (scenario.writes > 0) {
+        assert.equal(conn.writeTextFileCalls[0]?.content, scenario.expected);
+      }
+      assert.equal(readFileSync(path, "utf8"), scenario.diskAfter);
+      assert.equal(conn.readTextFileCalls.length, readsBeforeDispatch + 1);
+      assert.match(result.content, scenario.writes ? /File edited successfully/ : /changed while waiting/);
+    } finally {
+      release();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("write_file surfaces client writeTextFile failures as a failed tool result", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-write-client-fail-"));
@@ -1524,10 +1772,14 @@ test(
   async () => {
     const dir = mkdtempSync(join(tmpdir(), "glm-executor-cmd-background-survival-"));
     const marker = join(dir, "background-finished");
+    const staging = join(dir, "background-finished.tmp");
     const conn = createConnectionStub();
     const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
     try {
-      const command = `${shellNodeCommand()} -e 'setTimeout(() => require("node:fs").writeFileSync(${shellFixturePath(marker, "background-finished")}, "done"), 250)' >/dev/null 2>&1 & echo started`;
+      // Existence must mean a closed, complete write, rather than the empty
+      // file becoming visible between writeFileSync's open and write steps.
+      const fixture = `setTimeout(() => { const fs = require("node:fs"); const staging = ${shellFixturePath(staging, "background-finished.tmp")}; fs.writeFileSync(staging, "done"); fs.renameSync(staging, ${shellFixturePath(marker, "background-finished")}); }, 250)`;
+      const command = `${shellNodeCommand()} -e '${fixture}' >/dev/null 2>&1 & echo started`;
       const result = await exec.execute("tc1", "run_command", JSON.stringify({ command }));
       assert.match(result.content, /Exit code: 0/);
       const deadline = Date.now() + 2_500;
@@ -1797,23 +2049,23 @@ test("web_search uses stored credentials and calls the Coding Plan MCP search to
   await withStoredApiKey(async () => {
     await withMockedFetch(
       [
-        jsonResponse(
+        request => jsonResponse(
           {
             jsonrpc: "2.0",
-            id: 1,
+            id: request.id,
             result: { protocolVersion: "2025-06-18", capabilities: {} },
           },
           { sessionId: "search-session" }
         ),
         new Response(null, { status: 202 }),
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 2,
+          id: request.id,
           result: { tools: [{ name: "webSearchPrime", inputSchema: { properties: { search_query: { type: "string" } } } }] },
         }),
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 3,
+          id: request.id,
           result: {
             content: [
               {
@@ -1867,20 +2119,20 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
     process.env["Z_AI_API_KEY"] = "from-env";
     await withMockedFetch(
       [
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 1,
+          id: request.id,
           result: { protocolVersion: "2025-06-18", capabilities: {} },
         }),
         new Response(null, { status: 202 }),
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 2,
+          id: request.id,
           result: { tools: [{ name: "webReader" }] },
         }),
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 3,
+          id: request.id,
           result: {
             content: [
               {

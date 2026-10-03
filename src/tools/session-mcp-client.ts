@@ -11,8 +11,17 @@ import {
 import {
   clampMcpHttpErrorBody,
   exceedsMcpResponseLimit,
-  readMcpResponseText,
 } from "./mcp-response-limit.js";
+import {
+  cancelMcpHttpBody,
+  readMcpHttpResponseText,
+  readMcpHttpJsonRpcResponse,
+  type McpHttpJsonRpcResponse,
+  type McpHttpTimingOptions,
+  fetchMcpHttp,
+  withMcpHttpDeadline,
+  DEFAULT_MCP_HTTP_INITIALIZATION_TIMEOUT_MS,
+} from "./mcp-http-response.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 /** Generous: a cold `npx -y` fetch on Windows Defender can take well over a minute. */
@@ -213,7 +222,7 @@ export class HttpMcpClient implements ConnectedMcpClient {
   private activeRequests = new Set<AbortController>();
   private disposed = false;
 
-  constructor(private server: McpServerHttp & { type: "http" }) {}
+  constructor(private server: McpServerHttp & { type: "http" }, private options: McpHttpTimingOptions = {}) {}
 
   async listTools(signal?: AbortSignal): Promise<McpTool[]> {
     await this.awaitInitialization(signal);
@@ -318,7 +327,12 @@ export class HttpMcpClient implements ConnectedMcpClient {
     if (this.initialized) return this.initialized;
     const controller = new AbortController();
     this.initializationAbortController = controller;
-    const initialization = this.initialize(controller.signal);
+    const initialization = withMcpHttpDeadline(
+      signal => this.initialize(signal),
+      controller.signal,
+      this.options.initializationTimeoutMs ?? DEFAULT_MCP_HTTP_INITIALIZATION_TIMEOUT_MS,
+      "initialization",
+    );
     this.initialized = initialization;
     void initialization.then(
       () => {
@@ -385,12 +399,12 @@ export class HttpMcpClient implements ConnectedMcpClient {
       method: "POST",
       headers: this.headers("notifications/initialized"),
       body: JSON.stringify(body),
-    }, async response => {
+    }, async (response, requestSignal) => {
       if (!response.ok) {
-        const body = await readMcpResponseText(response);
+        const body = await readMcpHttpResponseText(response, requestSignal, this.options.bodyIdleTimeoutMs);
         throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${clampMcpHttpErrorBody(body)}`);
       }
-      await response.body?.cancel();
+      cancelMcpHttpBody(response);
     }, signal);
   }
 
@@ -400,17 +414,17 @@ export class HttpMcpClient implements ConnectedMcpClient {
     stage: string,
     signal?: AbortSignal,
     mcpName?: string
-  ): Promise<{ body: JsonRpcResponse; sessionId?: string }> {
+  ): Promise<{ body: McpHttpJsonRpcResponse; sessionId?: string }> {
     return this.fetchWithLifecycle({
       method: "POST",
       headers: this.headers(mcpMethod, mcpName),
       body: JSON.stringify(body),
-    }, async response => {
-      const text = await readMcpResponseText(response);
+    }, async (response, requestSignal) => {
       if (!response.ok) {
+        const text = await readMcpHttpResponseText(response, requestSignal, this.options.bodyIdleTimeoutMs);
         throw new Error(`MCP ${this.server.name} ${stage} failed: HTTP ${response.status}: ${clampMcpHttpErrorBody(text)}`);
       }
-      const parsed = parseMcpResponse(text, response.headers.get("Content-Type") ?? "");
+      const parsed = await readMcpHttpJsonRpcResponse(response, body.id!, requestSignal, this.options.bodyIdleTimeoutMs);
       if (parsed.error) {
         throw new Error(`MCP ${this.server.name} ${stage} failed: ${clampMcpHttpErrorBody(JSON.stringify(parsed.error))}`);
       }
@@ -422,21 +436,21 @@ export class HttpMcpClient implements ConnectedMcpClient {
   }
 
   private async fetchWithLifecycle<T>(
-    init: RequestInit, consume: (response: Response) => Promise<T>, signal?: AbortSignal,
+    init: RequestInit, consume: (response: Response, signal: AbortSignal) => Promise<T>, signal?: AbortSignal,
   ): Promise<T> {
     if (this.disposed) throw new Error(`MCP ${this.server.name} client disposed`);
     const controller = new AbortController();
     this.activeRequests.add(controller);
-    const onAbort = () => controller.abort();
+    const onAbort = () => controller.abort(signal?.reason);
     signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) controller.abort();
+    if (signal?.aborted) controller.abort(signal.reason);
     try {
-      const response = await fetch(this.server.url, { ...init, signal: controller.signal });
       // Keep cancellation and disposal ownership until body consumption ends.
-      return await consume(response);
+      return await fetchMcpHttp(this.server.url, init, consume, controller.signal, this.options);
     } finally {
       signal?.removeEventListener("abort", onAbort);
       this.activeRequests.delete(controller);
+      controller.abort();
     }
   }
 
@@ -539,8 +553,8 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.initializingChild = null;
     this.exited = true;
     this.exitReason = "client disposed";
-    if (child) await this.terminateChildAndWait(child);
     this.rejectAllPending(new Error("cancelled (client disposed)"));
+    if (child) await this.terminateChildAndWait(child);
   }
 
   /**
@@ -596,6 +610,10 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.child = child;
     this.initializingChild = child;
 
+    // Pipe errors are emitted asynchronously and are not ChildProcess errors.
+    child.stdin.on("error", (err) => {
+      this.failConnection(new Error(`stdin error: ${err.message}`, { cause: err }), child, true);
+    });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       if (this.child === child) this.handleStdout(chunk);
@@ -857,13 +875,26 @@ export class StdioMcpClient implements ConnectedMcpClient {
       this.buffer = this.buffer.slice(idx + 1);
       const line = raw.trim();
       if (!line) continue;
-      let parsed: JsonRpcResponse;
+      let decoded: unknown;
       try {
-        parsed = JSON.parse(line) as JsonRpcResponse;
+        decoded = JSON.parse(line);
       } catch {
         continue;
       }
-      if (typeof parsed.id !== "number") continue;
+      if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) continue;
+      const parsed = decoded as JsonRpcResponse;
+      if (typeof parsed.id !== "number" || !Number.isFinite(parsed.id)) continue;
+      if (parsed.jsonrpc !== undefined && parsed.jsonrpc !== "2.0") continue;
+      if (Object.hasOwn(parsed, "result") === Object.hasOwn(parsed, "error")) continue;
+      const error = parsed.error;
+      if (Object.hasOwn(parsed, "error")) {
+        if (error === null || typeof error !== "object" || Array.isArray(error)) continue;
+        // An error object without a usable message or code would reject the
+        // call with a garbage message; skip it so the valid reply settles.
+        const hasUsableMessage = typeof error.message === "string";
+        const hasUsableCode = typeof error.code === "string" || typeof error.code === "number";
+        if (!hasUsableMessage && !hasUsableCode) continue;
+      }
       const pending = this.pending.get(parsed.id);
       if (!pending) continue;
       this.pending.delete(parsed.id);
@@ -992,31 +1023,6 @@ function sanitizeToolName(name: string): string {
 function normalizeSchema(schema: Record<string, unknown> | undefined): Record<string, unknown> {
   if (!schema) return { type: "object", properties: {} };
   return schema;
-}
-
-function parseMcpResponse(text: string, contentType: string): JsonRpcResponse {
-  if (!text.trim()) {
-    throw new Error("MCP response was empty.");
-  }
-  if (contentType.toLowerCase().includes("text/event-stream")) {
-    return parseSseJsonRpc(text);
-  }
-  return JSON.parse(text) as JsonRpcResponse;
-}
-
-function parseSseJsonRpc(text: string): JsonRpcResponse {
-  const dataLines: string[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith("data:")) {
-      dataLines.push(line.slice("data:".length).trimStart());
-    }
-  }
-  for (const data of dataLines) {
-    if (!data || data === "[DONE]") continue;
-    const parsed = JSON.parse(data) as JsonRpcResponse;
-    if (parsed.result !== undefined || parsed.error !== undefined) return parsed;
-  }
-  throw new Error("MCP SSE response did not contain a JSON-RPC result.");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

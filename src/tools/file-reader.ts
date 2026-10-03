@@ -1,5 +1,29 @@
-import { open } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, stat, type FileHandle } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
+
+/** Follow ordinary file symlinks, but never read a FIFO, directory, or device. */
+async function openRegularFile(path: string, signal?: AbortSignal): Promise<FileHandle> {
+  if (signal?.aborted) throw new Error("The operation was aborted");
+  // Avoid opening known devices and special Windows paths. This preflight is
+  // not the authority: the path may change before open(), so validate the
+  // opened handle too. POSIX nonblocking open keeps a swapped FIFO from
+  // trapping a filesystem worker before that validation can run.
+  if (!(await stat(path)).isFile()) throw new Error("text reads require a regular file");
+  if (signal?.aborted) throw new Error("The operation was aborted");
+  const flags = process.platform === "win32"
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOCTTY;
+  const handle = await open(path, flags);
+  try {
+    if (!(await handle.stat()).isFile()) throw new Error("text reads require a regular file");
+    if (signal?.aborted) throw new Error("The operation was aborted");
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
 
 export interface TextPage {
   text: string;
@@ -23,7 +47,7 @@ export async function readLocalTextPage(
   maxReadBytes: number,
   signal?: AbortSignal,
 ): Promise<TextPage> {
-  const handle = await open(path, "r");
+  const handle = await openRegularFile(path, signal);
   try {
     const chunks: Buffer[] = [];
     let consumed = 0;
@@ -32,8 +56,9 @@ export async function readLocalTextPage(
       if (signal?.aborted) throw new Error("The operation was aborted");
       const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxReadBytes - consumed));
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (signal?.aborted) throw new Error("The operation was aborted");
       if (bytesRead === 0) { eof = true; break; }
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+      chunks.push(bytesRead === buffer.length ? buffer : Buffer.from(buffer.subarray(0, bytesRead)));
       consumed += bytesRead;
     }
     const bytes = Buffer.concat(chunks, consumed);
@@ -89,7 +114,7 @@ export async function readLocalTextPage(
 
 /** Read a complete local file only when it stays inside the configured edit budget. */
 export async function readLocalTextFileBounded(path: string, maxReadBytes: number, signal?: AbortSignal): Promise<string> {
-  const handle = await open(path, "r");
+  const handle = await openRegularFile(path, signal);
   try {
     const chunks: Buffer[] = [];
     let consumed = 0;
@@ -97,13 +122,35 @@ export async function readLocalTextFileBounded(path: string, maxReadBytes: numbe
       if (signal?.aborted) throw new Error("The operation was aborted");
       const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxReadBytes + 1 - consumed));
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (signal?.aborted) throw new Error("The operation was aborted");
       if (bytesRead === 0) return decodeUtf8Safely(Buffer.concat(chunks, consumed));
       consumed += bytesRead;
       if (consumed > maxReadBytes) {
         throw new Error(`file exceeds the ${maxReadBytes}-byte read/edit limit`);
       }
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+      chunks.push(bytesRead === buffer.length ? buffer : Buffer.from(buffer.subarray(0, bytesRead)));
     }
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Keep only a bounded UTF-8 prefix for optional project context. */
+export async function readLocalTextPrefix(path: string, maxReadBytes: number, signal?: AbortSignal): Promise<string> {
+  const handle = await openRegularFile(path, signal);
+  try {
+    const chunks: Buffer[] = [];
+    let consumed = 0;
+    while (consumed < maxReadBytes) {
+      if (signal?.aborted) throw new Error("The operation was aborted");
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxReadBytes - consumed));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (signal?.aborted) throw new Error("The operation was aborted");
+      if (bytesRead === 0) break;
+      chunks.push(bytesRead === buffer.length ? buffer : Buffer.from(buffer.subarray(0, bytesRead)));
+      consumed += bytesRead;
+    }
+    return decodeUtf8Safely(Buffer.concat(chunks, consumed));
   } finally {
     await handle.close();
   }

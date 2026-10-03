@@ -68,6 +68,7 @@ export class StdioVisionMcpClient implements VisionMcpClient {
   private buffer = "";
   private exited = false;
   private exitReason: string | null = null;
+  private disposed = false;
   private discoveredTools: DiscoveredTool[] = [];
   private stderrTail = "";
 
@@ -140,19 +141,21 @@ export class StdioVisionMcpClient implements VisionMcpClient {
 
   async dispose(): Promise<void> {
     const child = this.child;
+    this.disposed = true;
     this.child = null;
     this.initialized = null;
     this.initializingChild = null;
     this.discoveredTools = [];
     this.exited = true;
     this.exitReason = "client disposed";
+    this.rejectAllPending(new Error("cancelled (client disposed)"));
     if (child) {
       await this.terminateChildAndWait(child);
     }
-    this.rejectAllPending(new Error("cancelled (client disposed)"));
   }
 
   private ensureInitialized(): Promise<void> {
+    if (this.disposed) throw new Error("Vision MCP client disposed");
     if (this.initialized && this.child && !this.exited) return this.initialized;
     const initialization = this.startAndInitialize();
     this.initialized = initialization;
@@ -197,6 +200,10 @@ export class StdioVisionMcpClient implements VisionMcpClient {
     }
     this.child = child;
     this.initializingChild = child;
+    // Keep owning pipe errors through teardown, including late EPIPE events.
+    child.stdin.on("error", (err) => {
+      this.failConnection(new Error(`stdin error: ${err.message}`, { cause: err }), child, true);
+    });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       if (this.child === child) this.handleStdout(chunk);
@@ -267,10 +274,16 @@ export class StdioVisionMcpClient implements VisionMcpClient {
         reject: (err) => settle(reject, new Error(`${label} failed: ${this.withStderr(err.message)}`)),
       });
       const timer = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        const timeout = new Error(`request timed out after ${timeoutMs}ms`);
         const child = this.child;
-        if (child && this.pending.has(id)) {
-          this.failConnection(new Error(`request timed out after ${timeoutMs}ms`), child, true);
+        if (child) {
+          this.failConnection(timeout, child, true);
+          return;
         }
+        this.pending.delete(id);
+        pending.reject(timeout);
       }, timeoutMs);
       signal?.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted) {
@@ -396,13 +409,26 @@ export class StdioVisionMcpClient implements VisionMcpClient {
       this.buffer = this.buffer.slice(idx + 1);
       const line = raw.trim();
       if (!line) continue;
-      let parsed: { id?: number; result?: unknown; error?: { code?: number; message?: string } };
+      let decoded: unknown;
       try {
-        parsed = JSON.parse(line) as typeof parsed;
+        decoded = JSON.parse(line);
       } catch {
         continue;
       }
-      if (typeof parsed.id !== "number") continue;
+      if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) continue;
+      const parsed = decoded as { jsonrpc?: string; id?: number; result?: unknown; error?: { code?: string | number; message?: string } };
+      if (typeof parsed.id !== "number" || !Number.isFinite(parsed.id)) continue;
+      if (parsed.jsonrpc !== undefined && parsed.jsonrpc !== "2.0") continue;
+      if (Object.hasOwn(parsed, "result") === Object.hasOwn(parsed, "error")) continue;
+      const error = parsed.error;
+      if (Object.hasOwn(parsed, "error")) {
+        if (error === null || typeof error !== "object" || Array.isArray(error)) continue;
+        // An error object without a usable message or code would reject the
+        // call with a garbage message; skip it so the valid reply settles.
+        const hasUsableMessage = typeof error.message === "string";
+        const hasUsableCode = typeof error.code === "string" || typeof error.code === "number";
+        if (!hasUsableMessage && !hasUsableCode) continue;
+      }
       const pending = this.pending.get(parsed.id);
       if (!pending) continue;
       this.pending.delete(parsed.id);

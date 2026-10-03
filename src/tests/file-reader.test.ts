@@ -3,7 +3,28 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readLocalTextPage } from "../tools/file-reader.js";
+import { readLocalTextFileBounded, readLocalTextPage, readLocalTextPrefix } from "../tools/file-reader.js";
+
+test("local readers preserve text across multiple reads and a short final read", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-file-reader-"));
+  const path = join(dir, "chunks.txt");
+  const text = `${"a".repeat(64 * 1024 - 1)}🙂\n${"b".repeat(64 * 1024)}\nlast`;
+  const size = Buffer.byteLength(text);
+  writeFileSync(path, text);
+  try {
+    assert.deepEqual(await readLocalTextPage(path, 1, 10, size + 1), {
+      text,
+      firstLine: 1,
+      lastCompleteLine: 3,
+      totalLines: 3,
+      truncated: false,
+    });
+    assert.equal(await readLocalTextFileBounded(path, size), text);
+    assert.equal(await readLocalTextPrefix(path, size + 1), text);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("local reader caps a 600 KB single line without treating it as a next page", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-file-reader-"));

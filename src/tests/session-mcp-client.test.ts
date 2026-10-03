@@ -984,9 +984,10 @@ test("StdioMcpClient terminates the Windows process tree on dispose", async () =
   const listPromise = client.listTools();
 
   await tick();
+  const rejected = assert.rejects(listPromise, /disposed/i);
   await client.dispose();
 
-  await assert.rejects(listPromise, /disposed/i);
+  await rejected;
   assert.equal(terminatedPid, 5150);
   assert.equal(getKillCount(), 0);
 });
