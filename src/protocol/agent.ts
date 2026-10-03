@@ -999,7 +999,7 @@ export class GlmAcpAgent implements Agent {
         }
         session.updatedAt = new Date().toISOString();
         await this.persistSession(params.sessionId, session);
-        await safeSessionUpdate(this.connection, {
+        await safeSessionUpdate(promptConnection, {
           sessionId: params.sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
