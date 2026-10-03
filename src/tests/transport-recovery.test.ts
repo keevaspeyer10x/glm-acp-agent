@@ -182,6 +182,88 @@ test("a connection error after compaction drops the unsent prompt", async () => 
   }
 });
 
+test("a queued prompt during a no-output drop after compaction keeps the prior exchange", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-transport-compact-queued-"));
+  const store = new SessionStore(join(cwd, "sessions"));
+  let calls = 0;
+  let sawCompaction = false;
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let markEntered = (): void => {};
+  const entered = new Promise<void>((resolve) => {
+    markEntered = resolve;
+  });
+  const agent = new GlmAcpAgent({
+    sessionUpdate: async () => {},
+  } as never, {
+    sessionStore: store,
+    visionClient: null,
+    glm: {
+      async *streamChat(messages: { role?: string; content?: unknown }[]): AsyncGenerator<GlmStreamChunk> {
+        calls += 1;
+        if (calls === 1) {
+          yield { text: PRIOR_TURN };
+          yield { done: true, stopReason: "stop" };
+          return;
+        }
+        if (calls === 2) {
+          sawCompaction = messages.some((message) => message.role === "user" && String(message.content).includes("Context compaction"));
+          markEntered();
+          await gate;
+          throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+        }
+        throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+      },
+    },
+  });
+  const sessionId = (await agent.newSession({ cwd, mcpServers: [] })).sessionId;
+  try {
+    const prior = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "remember the bulk" }],
+    });
+    assert.equal(prior.stopReason, "end_turn");
+    const failing = agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "add the missing row" }],
+    });
+    await entered;
+    const queued = agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "queued follow up" }],
+    });
+    release();
+    const failed = await failing;
+    const queuedResult = await queued;
+    assert.equal(sawCompaction, true);
+    assert.equal(failed.stopReason, "cancelled");
+    assert.equal(queuedResult.stopReason, "cancelled");
+    const saved = store.load(sessionId);
+    assert.equal(
+      saved?.messages.some((message) => message.role === "user" && JSON.stringify(message).includes("remember the bulk")),
+      true
+    );
+    assert.equal(
+      saved?.messages.some((message) => message.role === "assistant" && String(message.content).startsWith("prior-turn")),
+      true
+    );
+    assert.equal(saved?.messages.some((message) => JSON.stringify(message).includes("add the missing row")), false);
+    assert.equal(saved?.messages.some((message) => JSON.stringify(message).includes("queued follow up")), false);
+    await agent.closeSession({ sessionId });
+    const afterClose = store.load(sessionId);
+    assert.equal(
+      afterClose?.messages.some((message) => message.role === "assistant" && String(message.content).startsWith("prior-turn")),
+      true,
+      "closing the session must not replace the checkpoint with the shortened transcript"
+    );
+  } finally {
+    release();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("a dropped stream after compaction keeps partial work", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-transport-compact-partial-"));
   const store = new SessionStore(join(cwd, "sessions"));
