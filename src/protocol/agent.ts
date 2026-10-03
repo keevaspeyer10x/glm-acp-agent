@@ -204,6 +204,12 @@ interface SessionState {
    * own. Serialized to indices at save time and rebuilt on load.
    */
   displayText: WeakMap<GlmMessage, string>;
+  /**
+   * Message list from before this prompt's compaction. A connection drop
+   * before any reply restores it, so the shortened transcript is not saved.
+   * Not persisted.
+   */
+  messagesBeforeCompaction?: GlmMessage[];
   /** Synchronous gate for replacement and close transitions. */
   lifecycle: SessionLifecycle;
 }
@@ -983,16 +989,23 @@ export class GlmAcpAgent implements Agent {
       if (isRecoverableTransportError(err) && userMessage) {
         // Compaction replaces the live user message with a new object before
         // the provider call, so identity lookup misses the turn that just ran.
-        let start = -1;
-        for (let index = session.messages.length - 1; index >= 0; index--) {
-          if (session.messages[index]?.role === "user") {
-            start = index;
-            break;
+        const lastUserIndex = (messages: GlmMessage[]): number => {
+          for (let index = messages.length - 1; index >= 0; index--) {
+            if (messages[index]?.role === "user") return index;
           }
+          return -1;
+        };
+        let start = lastUserIndex(session.messages);
+        const keptWork = start >= 0 && session.messages.slice(start + 1)
+          .some((message) => message.role === "assistant" || message.role === "tool");
+        // Compaction has already dropped earlier turns. Put that list back
+        // before removing the unsent prompt, or this save and the later close
+        // replace the checkpoint with only the system message.
+        if (!keptWork && session.messagesBeforeCompaction) {
+          session.messages = session.messagesBeforeCompaction;
+          start = lastUserIndex(session.messages);
         }
         const currentTurn = start >= 0 ? session.messages[start] : undefined;
-        const keptWork = currentTurn !== undefined && session.messages.slice(start + 1)
-          .some((message) => message.role === "assistant" || message.role === "tool");
         if (currentTurn && !keptWork) {
           session.messages.splice(start, 1);
           session.displayText.delete(currentTurn);
@@ -1036,6 +1049,9 @@ export class GlmAcpAgent implements Agent {
       // may clear them, and resolution follows all preprocessing/cleanup.
       if (session.abortController === abortController) session.abortController = null;
       if (session.promptPromise === promptPromise) session.promptPromise = null;
+      // Release the pre-compaction list only after this prompt has used it.
+      // The next prompt does not run until this one resolves.
+      session.messagesBeforeCompaction = undefined;
       resolvePromptPromise();
       // A timed-out fork/restore attaches its durable checkpoint to the prompt
       // drain. Signal the chain first (the checkpoint depends on it), then keep
@@ -2359,6 +2375,9 @@ export class GlmAcpAgent implements Agent {
     }
     const result = compactToBudget(session.messages, budget, force);
     if (!result.changed) return false;
+    if (session.messagesBeforeCompaction === undefined) {
+      session.messagesBeforeCompaction = session.messages;
+    }
     let lastUser = -1;
     for (let index = result.messages.length - 1; index >= 0; index--) {
       if (result.messages[index]?.role === "user") { lastUser = index; break; }

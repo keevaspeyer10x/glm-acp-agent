@@ -160,8 +160,24 @@ test("a connection error after compaction drops the unsent prompt", async () => 
       saved?.messages.some((message) => JSON.stringify(message).includes("add the missing row")),
       false
     );
-  } finally {
+    assert.equal(
+      saved?.messages.some((message) => message.role === "user" && JSON.stringify(message).includes("remember the bulk")),
+      true,
+      "the prior user turn must survive a no-output drop after compaction"
+    );
+    assert.equal(
+      saved?.messages.some((message) => message.role === "assistant" && String(message.content).startsWith("prior-turn")),
+      true,
+      "the prior assistant turn must survive a no-output drop after compaction"
+    );
     await agent.closeSession({ sessionId });
+    const afterClose = store.load(sessionId);
+    assert.equal(
+      afterClose?.messages.some((message) => message.role === "user" && JSON.stringify(message).includes("remember the bulk")),
+      true,
+      "closing the session must not replace the checkpoint with the shortened transcript"
+    );
+  } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
