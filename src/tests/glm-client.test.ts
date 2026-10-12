@@ -682,6 +682,7 @@ test("isRecoverableTransportError accepts connection drops and rejects HTTP stat
 interface OwnedDispatcher {
   closed: boolean;
   destroyed: boolean;
+  close: () => Promise<void>;
   destroy: () => Promise<void>;
 }
 
@@ -744,7 +745,14 @@ function captureStderr(): { text: () => string; restore: () => void } {
 }
 
 test("each provider client owns a connection pool and a failed rebuild keeps the old one", () => {
-  const restore = withSavedEnv({ Z_AI_API_KEY: "test-key" });
+  // resolveApiKey() falls back to $XDG_CONFIG_HOME/glm-acp-agent/credentials.json
+  // when the env var is unset, so an empty config dir is required or a
+  // machine that has run --setup would rebuild successfully.
+  const emptyConfig = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-noconfig-"));
+  const restore = withSavedEnv({
+    Z_AI_API_KEY: "test-key",
+    XDG_CONFIG_HOME: emptyConfig,
+  });
   try {
     const first = new GlmClient();
     const second = new GlmClient();
@@ -764,9 +772,11 @@ test("each provider client owns a connection pool and a failed rebuild keeps the
       logs.restore();
     }
     assert.equal(clientInternals(first).dispatcher, firstPool);
+    assert.equal(firstPool.closed, false);
     assert.equal(firstPool.destroyed, false);
   } finally {
     restore();
+    rmSync(emptyConfig, { recursive: true, force: true });
   }
 });
 
@@ -792,7 +802,7 @@ test("streamChat closes the connection pool when the body fails with a socket re
       }
     });
     assert.notEqual(internals.dispatcher, previous);
-    assert.equal(previous.destroyed, true);
+    assert.equal(previous.closed, true);
   } finally {
     await internals.dispatcher.destroy().catch(() => undefined);
     restore();
@@ -827,7 +837,7 @@ test("a dropped connection retries twice, logs each attempt, and then replaces t
     assert.match(stderr, /provider request attempt 2 failed: code=\S+/);
     assert.match(stderr, /provider request attempt 3 failed: code=\S+/);
     assert.notEqual(clientInternals(client).dispatcher, previous);
-    assert.equal(previous.destroyed, true);
+    assert.equal(previous.closed, true);
   } finally {
     if (savedBase === undefined) delete process.env["ACP_GLM_BASE_URL"];
     else process.env["ACP_GLM_BASE_URL"] = savedBase;

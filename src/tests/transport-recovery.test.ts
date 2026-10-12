@@ -374,6 +374,136 @@ test("every failed open cancels the turn", async () => {
   }
 });
 
+test("replacing the shared pool lets another session finish the response it is reading", { timeout: 20_000 }, async () => {
+  // One GlmClient serves every session. Retiring its pool with destroy()
+  // aborts the other session's body (`TypeError: terminated`) and that prompt
+  // rejects without a durable save. close() has to leave the read running.
+  let releaseHealthy = (): void => {};
+  const healthyHeld = new Promise<void>((resolve) => {
+    releaseHealthy = () => resolve();
+  });
+  let markStreaming = (): void => {};
+  const healthyStreaming = new Promise<void>((resolve) => {
+    markStreaming = () => resolve();
+  });
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("error", () => undefined);
+    res.on("error", () => undefined);
+    req.socket.on("error", () => undefined);
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (body.includes("drop the link")) {
+        req.socket.destroy();
+        return;
+      }
+      if (!body.includes("hold this stream")) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "unexpected request" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.socket?.setNoDelay(true);
+      res.write(`data: ${JSON.stringify({
+        id: "chatcmpl-healthy",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { content: "kept alive" }, finish_reason: null }],
+      })}\n\n`);
+      void healthyHeld.then(() => {
+        if (res.writableEnded) return;
+        res.write(`data: ${JSON.stringify({
+          id: "chatcmpl-healthy",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        })}\n\n`);
+        res.end("data: [DONE]\n\n");
+      });
+    });
+  });
+  server.on("clientError", () => undefined);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("test server has no port");
+  const savedKey = process.env["Z_AI_API_KEY"];
+  const savedBase = process.env["ACP_GLM_BASE_URL"];
+  process.env["Z_AI_API_KEY"] = "test-key";
+  process.env["ACP_GLM_BASE_URL"] = `http://127.0.0.1:${address.port}/v1`;
+  const cwd = mkdtempSync(join(tmpdir(), "glm-transport-shared-"));
+  const store = new SessionStore(join(cwd, "sessions"));
+  const agent = new GlmAcpAgent({
+    sessionUpdate: async (update: { update: { sessionUpdate: string; content?: { text?: string } } }) => {
+      if (update.update.content?.text?.includes("kept alive")) markStreaming();
+    },
+  } as never, {
+    sessionStore: store,
+    visionClient: null,
+  });
+  const healthyId = (await agent.newSession({ cwd, mcpServers: [] })).sessionId;
+  const droppedId = (await agent.newSession({ cwd, mcpServers: [] })).sessionId;
+  const poolOf = (): { closed: boolean; destroyed: boolean; destroy: () => Promise<void> } => {
+    const dispatcher = (agent as unknown as {
+      _glm?: { dispatcher?: { closed: boolean; destroyed: boolean; destroy: () => Promise<void> } };
+    })._glm?.dispatcher;
+    if (!dispatcher) throw new Error("shared provider client was not created");
+    return dispatcher;
+  };
+  const healthy = agent.prompt({
+    sessionId: healthyId,
+    prompt: [{ type: "text", text: "hold this stream" }],
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("healthy session did not start streaming")), 5_000);
+      healthyStreaming.then(() => {
+        clearTimeout(timer);
+        resolve();
+      }, (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    const previous = poolOf();
+    const failed = await agent.prompt({
+      sessionId: droppedId,
+      prompt: [{ type: "text", text: "drop the link" }],
+    });
+    assert.equal(failed.stopReason, "cancelled");
+    assert.notEqual(poolOf(), previous);
+    // close() marks the pool closed immediately and destroys it only after
+    // the in-flight body ends. destroy() would already report destroyed.
+    assert.equal(previous.closed, true);
+    assert.equal(previous.destroyed, false);
+    releaseHealthy();
+    const continued = await healthy;
+    assert.equal(continued.stopReason, "end_turn");
+    const saved = store.load(healthyId);
+    assert.equal(
+      saved?.messages.some((message) => message.role === "assistant" && message.content === "kept alive"),
+      true
+    );
+    const dropped = store.load(droppedId);
+    assert.equal(
+      dropped?.messages.some((message) => JSON.stringify(message).includes("drop the link")),
+      false
+    );
+  } finally {
+    releaseHealthy();
+    await healthy.catch(() => undefined);
+    if (savedKey === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = savedKey;
+    if (savedBase === undefined) delete process.env["ACP_GLM_BASE_URL"];
+    else process.env["ACP_GLM_BASE_URL"] = savedBase;
+    const dispatcher = (agent as unknown as {
+      _glm?: { dispatcher?: { destroy: () => Promise<void> } };
+    })._glm?.dispatcher;
+    await dispatcher?.destroy().catch(() => undefined);
+    await agent.shutdown("sigterm").catch(() => undefined);
+    await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("two connection drops in a row both cancel and the session stays usable", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-transport-twice-"));
   const store = new SessionStore(join(cwd, "sessions"));

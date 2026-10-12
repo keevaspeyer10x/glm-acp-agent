@@ -367,8 +367,10 @@ export function getDefaultModel(): string {
  *
  * Each instance owns an undici connection pool. `new OpenAI({ apiKey, baseURL })`
  * alone uses `globalThis.fetch` and Node's shared pool, so replacing the
- * wrapper would not open a new connection. The pool is closed when the
- * client is discarded after a dropped connection.
+ * wrapper would not open a new connection. After a dropped connection the
+ * next request uses a new pool immediately. The previous pool is closed
+ * so a response another session is still reading can finish; it is not
+ * destroyed, which would abort that read.
  */
 export class GlmClient {
   private client: OpenAI;
@@ -423,8 +425,11 @@ export class GlmClient {
   }
 
   /**
-   * Drop the current HTTP client and close its pool. The next request uses
-   * a new pool. If a replacement cannot be built, the current client stays.
+   * Route later requests to a new pool immediately. The previous pool is
+   * closed so in-flight reads on it can finish: one GlmClient is shared by
+   * every session, and destroy() would abort the healthy ones with
+   * `TypeError: terminated`. If a replacement cannot be built, the current
+   * client stays.
    */
   private discardTransport(): void {
     const previousClient = this.client;
@@ -433,7 +438,7 @@ export class GlmClient {
       const next = this.buildClient();
       this.client = next.client;
       this.dispatcher = next.dispatcher;
-      void this.destroyDispatcher(previousDispatcher);
+      this.retireDispatcher(previousDispatcher);
     } catch (err) {
       this.client = previousClient;
       this.dispatcher = previousDispatcher;
@@ -445,8 +450,24 @@ export class GlmClient {
     }
   }
 
+  /** A pool that never served a request can be torn down immediately. */
   private destroyDispatcher(dispatcher: Dispatcher): Promise<void> {
     return dispatcher.destroy(new Error("discarded provider connection")).catch((err: unknown) => {
+      warn(
+        `could not close the discarded provider connection: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    });
+  }
+
+  /**
+   * Stop new requests on a pool and let the ones already running finish.
+   * Not awaited: the session that hit the failure must not wait for every
+   * other session still reading this pool.
+   */
+  private retireDispatcher(dispatcher: Dispatcher): void {
+    void dispatcher.close().catch((err: unknown) => {
       warn(
         `could not close the discarded provider connection: ${
           err instanceof Error ? err.message : String(err)
