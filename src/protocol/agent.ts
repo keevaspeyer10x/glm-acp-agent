@@ -205,9 +205,9 @@ interface SessionState {
    */
   displayText: WeakMap<GlmMessage, string>;
   /**
-   * Message list from before this prompt's compaction. A connection drop
-   * before any reply restores it, so the shortened transcript is not saved.
-   * Not persisted.
+   * Message list from before this prompt's compaction. Restored when a
+   * cancelled or dropped turn produced no reply, so the shortened transcript
+   * is not saved. Not persisted.
    */
   messagesBeforeCompaction?: GlmMessage[];
   /** Synchronous gate for replacement and close transitions. */
@@ -940,15 +940,15 @@ export class GlmAcpAgent implements Agent {
 
       // A queued prompt aborts this turn. The loop then reports cancellation
       // instead of the connection error, and the following save would replace
-      // the checkpoint with the shortened transcript.
-      if (abortController.signal.aborted || stopReason === "cancelled") {
-        if (this.restoreCompactedUnsentPrompt(session) === "restored") {
+      // the checkpoint with the shortened transcript. Restoring keeps the
+      // prompt, matching a cancel that never compacted.
+      const turnCancelled = abortController.signal.aborted || stopReason === "cancelled";
+      const restoredHistory = turnCancelled ? this.restoreCompactedHistory(session, false) : "none";
+      if (!ownsPrompt()) {
+        if (restoredHistory === "restored") {
           session.updatedAt = new Date().toISOString();
           await this.persistSession(params.sessionId, session);
         }
-      }
-
-      if (!ownsPrompt()) {
         return cancelledResponse();
       }
       session.updatedAt = new Date().toISOString();
@@ -989,7 +989,7 @@ export class GlmAcpAgent implements Agent {
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
       if (abortController.signal.aborted || !ownsPrompt()) {
-        if (this.restoreCompactedUnsentPrompt(session) === "restored") {
+        if (this.restoreCompactedHistory(session, false) === "restored") {
           session.updatedAt = new Date().toISOString();
           await this.persistSession(params.sessionId, session);
         }
@@ -998,18 +998,12 @@ export class GlmAcpAgent implements Agent {
       // A dropped provider connection must not fail the JSON-RPC prompt.
       // Paseo and other clients turn a thrown error into -32603 and then keep
       // sending later prompts through the same dead HTTP client. End the turn
-      // as cancelled, keep any text that already streamed, and leave the
-      // session idle so the next message opens a new connection.
+      // as cancelled, keep any text or tool result already in history, and
+      // leave the session idle so the next message opens a new connection.
       if (isRecoverableTransportError(err) && userMessage) {
         // Compaction replaces the live user message with a new object before
         // the provider call, so identity lookup misses the turn that just ran.
-        const rollback = this.restoreCompactedUnsentPrompt(session);
-        const lastUserIndex = (messages: GlmMessage[]): number => {
-          for (let index = messages.length - 1; index >= 0; index--) {
-            if (messages[index]?.role === "user") return index;
-          }
-          return -1;
-        };
+        const rollback = this.restoreCompactedHistory(session, true);
         let keptWork = rollback === "kept";
         if (rollback === "none") {
           const start = lastUserIndex(session.messages);
@@ -1023,6 +1017,11 @@ export class GlmAcpAgent implements Agent {
         }
         session.updatedAt = new Date().toISOString();
         await this.persistSession(params.sessionId, session);
+        // A close or cancel that arrived while the checkpoint was written
+        // must not wait on the notice. Delivery below is also abortable.
+        if (abortController.signal.aborted || !ownsPrompt()) {
+          return cancelledResponse();
+        }
         await safeSessionUpdate(promptConnection, {
           sessionId: params.sessionId,
           update: {
@@ -1802,27 +1801,27 @@ export class GlmAcpAgent implements Agent {
   // ---------------------------------------------------------------------------
 
   /**
-   * A cancelled prompt can leave the shortened transcript in memory. Put the
-   * pre-compaction messages back and drop the unsent prompt before any save.
+   * A cancelled or dropped prompt can leave the shortened transcript in
+   * memory. Put the pre-compaction messages back before any save. A
+   * connection drop with no reply also removes the unsent prompt. A cancel
+   * keeps that prompt, which is what a cancel does when compaction did not run.
    */
-  private restoreCompactedUnsentPrompt(session: SessionState): "restored" | "kept" | "none" {
+  private restoreCompactedHistory(
+    session: SessionState,
+    dropUnsentPrompt: boolean,
+  ): "restored" | "kept" | "none" {
     const prior = session.messagesBeforeCompaction;
     if (!prior) return "none";
-    const lastUserIndex = (messages: GlmMessage[]): number => {
-      for (let index = messages.length - 1; index >= 0; index--) {
-        if (messages[index]?.role === "user") return index;
-      }
-      return -1;
-    };
-    let start = lastUserIndex(session.messages);
+    const start = lastUserIndex(session.messages);
     const keptWork = start >= 0 && session.messages.slice(start + 1)
       .some((message) => message.role === "assistant" || message.role === "tool");
     if (keptWork) return "kept";
-    session.messages = prior;
-    start = lastUserIndex(session.messages);
-    const currentTurn = start >= 0 ? session.messages[start] : undefined;
+    session.messages = prior.slice();
+    if (!dropUnsentPrompt) return "restored";
+    const unsent = lastUserIndex(session.messages);
+    const currentTurn = unsent >= 0 ? session.messages[unsent] : undefined;
     if (currentTurn) {
-      session.messages.splice(start, 1);
+      session.messages.splice(unsent, 1);
       session.displayText.delete(currentTurn);
     }
     return "restored";
@@ -2666,6 +2665,13 @@ function deserializeRestoredDisplayText(
     Object.entries(persisted).map(([index, text]) => [String(Number(index) + offset), text])
   );
   return deserializeDisplayText(restoredMessages, shifted);
+}
+
+function lastUserIndex(messages: GlmMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index]?.role === "user") return index;
+  }
+  return -1;
 }
 
 /** Flatten the `content` of a user message into a plain string for replay. */

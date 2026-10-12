@@ -257,7 +257,11 @@ When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` fami
 
 The provider stream itself is guarded against stalls. The Z.AI SDK's HTTP timeout only covers waiting for response headers — a response whose body stops mid-stream would otherwise hang the turn forever. The agent therefore aborts a provider stream read that produces no data for `ACP_GLM_STREAM_IDLE_TIMEOUT_MS` milliseconds (default `300000`; invalid values for the variable fall back to the default with a stderr warning). On timeout, whatever partial output already reached the user is kept, an `[error]` message is appended as an agent message, the turn ends, and the last valid on-disk session checkpoint is preserved. A slow ACP client back-pressuring chunks it already received does not trip the watchdog — only silence from the provider between reads does.
 
-A dropped network connection is handled separately from a stall. If the provider request fails before an HTTP status arrives (`APIConnectionError`, or a socket error such as `ECONNRESET`), the agent discards its HTTP client and retries the open twice. If the link is still down, the turn ends with `stopReason: "cancelled"` instead of a JSON-RPC internal error, so the session stays open. A turn that produced no assistant text or tool result drops that user message and asks for it to be sent again. Partial text that already streamed is kept, and the next message continues the same session on a new connection. An HTTP error such as 401 or 429 still fails the turn.
+A dropped network connection is handled separately from a stall. Each provider client has its own connection pool. When a request fails before an HTTP status arrives (`APIConnectionError`, including a connection timeout, or a socket error such as `ECONNRESET`), the agent closes that pool and the next request opens another. The OpenAI client retries a failed open twice (`maxRetries: 2`). Those same two retries cover HTTP 408, 409, 429, and 5xx. The agent does not wrap the client in a second retry loop. If the link is still down after that budget, the turn ends with `stopReason: "cancelled"` instead of a JSON-RPC internal error, and the session stays open. A turn that produced no assistant text or tool result drops that user message and asks for it to be sent again. Assistant text or a tool result that already arrived is kept. The next message continues the same session on a new connection. An HTTP status such as 400 or 401 fails the turn.
+
+A socket reset after response bytes have started is not retried. That turn still ends with `stopReason: "cancelled"` and a connection-lost notice, and the text or tool result already in the session stays there. The idle-stream watchdog and an incomplete tool-call stream still fail the turn with an error and leave the previous checkpoint in place.
+
+Cancelling a turn keeps the user's prompt whether or not the history was compacted for that request. When compaction already ran and the cancelled turn produced no reply, the pre-compaction messages are restored and the prompt stays, so the saved checkpoint still contains the earlier exchange. A connection drop with no reply is the path that removes the unsent prompt.
 
 #### Thought level (reasoning effort)
 
@@ -473,6 +477,7 @@ src/
     ├── credentials.test.ts   # Credential resolution and --setup persistence
     ├── executor.test.ts      # Tests for ToolExecutor
     ├── glm-client.test.ts    # Tests for streaming / tool-call assembly
+    ├── transport-recovery.test.ts # Connection-loss retry and session recovery
     ├── slash-commands.test.ts # Command discovery and `/name` expansion
     └── integration.test.ts   # End-to-end tests over the real ACP ndjson transport
 ```
@@ -499,6 +504,7 @@ The test suite covers:
 - Permission flows for `write_file` and `run_command` (allow / reject / cancel)
 - Shell-quoted argument handling for `list_files` and `run_command`
 - GLM streaming: text deltas, `reasoning_content` deltas, multi-chunk tool-call assembly, and trailing usage
+- Connection loss: one retry budget for a dropped open and for HTTP 408/409/429/5xx, a cancelled turn, an unanswered prompt dropped, partial text or a tool result kept, and the same session accepting the next prompt
 - Image preprocessing through a mocked Vision MCP client and graceful degradation on Vision MCP failures
 
 ---
@@ -508,6 +514,7 @@ The test suite covers:
 - **`No API key found.`** — either set `Z_AI_API_KEY` in the environment, or run `glm-acp-agent --setup` (or `node dist/index.js --setup` from a source clone) once to store the key on disk.
 - **`HTTP 401: Invalid API key`** — your key is wrong or expired; rotate it on <https://z.ai/manage-apikey/apikey-list>.
 - **`Connection lost. Send the message again when you are back online.`** — the link to Z.AI dropped before this turn produced a reply. The session is still open. Send the prompt again once the network is back.
+- **`Connection lost. Send a message to continue.`** — the link dropped after this turn already produced assistant text or a tool result. That work is still in the session. Send another message to continue.
 - **Writes or commands never get to run.** — make sure your ACP client supports `session/request_permission` and that you approve the prompt for the specific tool call.
 
 ---
