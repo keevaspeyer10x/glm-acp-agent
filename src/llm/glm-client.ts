@@ -247,6 +247,14 @@ function isSdkRetryableStatus(status: number): boolean {
   return status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
+/** One undici pool and the fetches currently inside it. */
+interface ProviderPool {
+  inflight: number;
+  /** A newer pool has taken over. Close this one when `inflight` hits zero. */
+  retired: boolean;
+  closed: boolean;
+}
+
 /** Default base URL for the Z.AI / Zhipu OpenAI-compatible API (Coding endpoint). */
 const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
@@ -368,13 +376,16 @@ export function getDefaultModel(): string {
  * Each instance owns an undici connection pool. `new OpenAI({ apiKey, baseURL })`
  * alone uses `globalThis.fetch` and Node's shared pool, so replacing the
  * wrapper would not open a new connection. After a dropped connection the
- * next request uses a new pool immediately. The previous pool is closed
- * so a response another session is still reading can finish; it is not
- * destroyed, which would abort that read.
+ * next request uses a new pool immediately. Every attempt, including an SDK
+ * retry that was already waiting, resolves that live pool. The previous pool
+ * is closed once its own fetches have returned, so a response another session
+ * is still reading can finish; it is not destroyed, which would abort that read.
  */
 export class GlmClient {
   private client: OpenAI;
   private dispatcher: Dispatcher;
+  /** Fetches currently inside each pool. A retired pool closes at zero. */
+  private readonly pools = new Map<Dispatcher, ProviderPool>();
   private readonly baseURL: string;
   private maxTokens: number;
   /** Resolved once at construction; later env changes cannot affect a running client. */
@@ -415,8 +426,11 @@ export class GlmClient {
         apiKey,
         baseURL: this.baseURL,
         maxRetries: PROVIDER_MAX_RETRIES,
-        fetch: (input, init) => this.fetchWithDispatcher(dispatcher, input, init),
+        // Resolve the dispatcher on each attempt. The SDK retries through this
+        // same function, including after another session has replaced the pool.
+        fetch: (input, init) => this.fetchUsingLivePool(input, init),
       });
+      this.pools.set(dispatcher, { inflight: 0, retired: false, closed: false });
       return { client, dispatcher };
     } catch (err) {
       void this.destroyDispatcher(dispatcher);
@@ -425,11 +439,12 @@ export class GlmClient {
   }
 
   /**
-   * Route later requests to a new pool immediately. The previous pool is
-   * closed so in-flight reads on it can finish: one GlmClient is shared by
-   * every session, and destroy() would abort the healthy ones with
-   * `TypeError: terminated`. If a replacement cannot be built, the current
-   * client stays.
+   * Route later requests to a new pool immediately. Fetches already on the
+   * previous pool finish there; the pool is closed when the last of them
+   * returns, so a body still being read is not aborted. One GlmClient is
+   * shared by every session, and destroy() would abort the healthy ones
+   * with `TypeError: terminated`. If a replacement cannot be built, the
+   * current client stays.
    */
   private discardTransport(): void {
     const previousClient = this.client;
@@ -438,7 +453,9 @@ export class GlmClient {
       const next = this.buildClient();
       this.client = next.client;
       this.dispatcher = next.dispatcher;
-      this.retireDispatcher(previousDispatcher);
+      const previous = this.pools.get(previousDispatcher);
+      if (previous) previous.retired = true;
+      this.closePoolIfIdle(previousDispatcher);
     } catch (err) {
       this.client = previousClient;
       this.dispatcher = previousDispatcher;
@@ -462,11 +479,35 @@ export class GlmClient {
   }
 
   /**
+   * Count this attempt against the pool it will actually use. The OpenAI
+   * client sleeps between retries with no request on the wire; those later
+   * attempts must take the replacement pool instead of one already closed.
+   */
+  private fetchUsingLivePool(
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const dispatcher = this.dispatcher;
+    const state = this.pools.get(dispatcher);
+    if (!state) return this.fetchWithDispatcher(dispatcher, input, init);
+    state.inflight += 1;
+    return this.fetchWithDispatcher(dispatcher, input, init).finally(() => {
+      state.inflight -= 1;
+      this.closePoolIfIdle(dispatcher);
+    });
+  }
+
+  /**
    * Stop new requests on a pool and let the ones already running finish.
    * Not awaited: the session that hit the failure must not wait for every
-   * other session still reading this pool.
+   * other session still reading this pool. A pool that still has a fetch
+   * in progress stays open until that fetch returns.
    */
-  private retireDispatcher(dispatcher: Dispatcher): void {
+  private closePoolIfIdle(dispatcher: Dispatcher): void {
+    const state = this.pools.get(dispatcher);
+    if (!state || !state.retired || state.closed || state.inflight > 0) return;
+    state.closed = true;
+    this.pools.delete(dispatcher);
     void dispatcher.close().catch((err: unknown) => {
       warn(
         `could not close the discarded provider connection: ${

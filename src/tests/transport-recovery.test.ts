@@ -504,6 +504,149 @@ test("replacing the shared pool lets another session finish the response it is r
   }
 });
 
+test("a session waiting to retry uses the replacement pool", { timeout: 20_000 }, async () => {
+  // Session B is inside the SDK's retry sleep when session A drops and
+  // retires the shared pool. B's next attempt has to reach the provider on
+  // the replacement; a dispatch on the closed pool becomes APIConnectionError
+  // and the unanswered prompt is removed.
+  const retryAfterMs = 4_000;
+  let markBackoff = (): void => {};
+  const backoffStarted = new Promise<void>((resolve) => {
+    markBackoff = () => resolve();
+  });
+  let retryAttempts = 0;
+  let dropAttempts = 0;
+  let poolRebuilt = false;
+  let sawRetryAfterRebuild = false;
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("error", () => undefined);
+    res.on("error", () => undefined);
+    req.socket.on("error", () => undefined);
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (body.includes("drop the link")) {
+        dropAttempts += 1;
+        req.socket.destroy();
+        return;
+      }
+      if (!body.includes("wait out the limit")) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "unexpected request" } }));
+        return;
+      }
+      retryAttempts += 1;
+      if (retryAttempts === 1) {
+        res.writeHead(429, {
+          "content-type": "application/json",
+          "retry-after-ms": String(retryAfterMs),
+        });
+        res.end(JSON.stringify({ error: { message: "slow down", type: "server_error" } }));
+        markBackoff();
+        return;
+      }
+      if (poolRebuilt) sawRetryAfterRebuild = true;
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.end(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-retry",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: { content: "retry landed" }, finish_reason: null }],
+        })}\n\n` +
+        `data: ${JSON.stringify({
+          id: "chatcmpl-retry",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        })}\n\n` +
+        "data: [DONE]\n\n"
+      );
+    });
+  });
+  server.on("clientError", () => undefined);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("test server has no port");
+  const savedKey = process.env["Z_AI_API_KEY"];
+  const savedBase = process.env["ACP_GLM_BASE_URL"];
+  process.env["Z_AI_API_KEY"] = "test-key";
+  process.env["ACP_GLM_BASE_URL"] = `http://127.0.0.1:${address.port}/v1`;
+  const cwd = mkdtempSync(join(tmpdir(), "glm-transport-retry-"));
+  const store = new SessionStore(join(cwd, "sessions"));
+  const agent = new GlmAcpAgent({ sessionUpdate: async () => {} } as never, {
+    sessionStore: store,
+    visionClient: null,
+  });
+  const retryId = (await agent.newSession({ cwd, mcpServers: [] })).sessionId;
+  const droppedId = (await agent.newSession({ cwd, mcpServers: [] })).sessionId;
+  const poolOf = (): { closed: boolean; destroyed: boolean } => {
+    const dispatcher = (agent as unknown as {
+      _glm?: { dispatcher?: { closed: boolean; destroyed: boolean } };
+    })._glm?.dispatcher;
+    if (!dispatcher) throw new Error("shared provider client was not created");
+    return dispatcher;
+  };
+  const retrying = agent.prompt({
+    sessionId: retryId,
+    prompt: [{ type: "text", text: "wait out the limit" }],
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("retry backoff did not start")), 5_000);
+      backoffStarted.then(() => {
+        clearTimeout(timer);
+        resolve();
+      }, (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    const previous = poolOf();
+    const failed = await agent.prompt({
+      sessionId: droppedId,
+      prompt: [{ type: "text", text: "drop the link" }],
+    });
+    poolRebuilt = true;
+    assert.equal(failed.stopReason, "cancelled");
+    assert.equal(dropAttempts, PROVIDER_MAX_RETRIES + 1);
+    assert.notEqual(poolOf(), previous);
+    // The 429 response has already finished, so this pool is idle and closed
+    // while B is still asleep. B's next attempt must not dispatch on it.
+    assert.equal(previous.closed, true);
+    const continued = await retrying;
+    assert.equal(continued.stopReason, "end_turn");
+    assert.equal(retryAttempts, 2);
+    assert.equal(sawRetryAfterRebuild, true);
+    const saved = store.load(retryId);
+    assert.equal(
+      saved?.messages.some((message) => message.role === "assistant" && message.content === "retry landed"),
+      true
+    );
+    assert.equal(
+      saved?.messages.some((message) => message.role === "user" && JSON.stringify(message).includes("wait out the limit")),
+      true
+    );
+    const dropped = store.load(droppedId);
+    assert.equal(
+      dropped?.messages.some((message) => JSON.stringify(message).includes("drop the link")),
+      false
+    );
+  } finally {
+    await retrying.catch(() => undefined);
+    if (savedKey === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = savedKey;
+    if (savedBase === undefined) delete process.env["ACP_GLM_BASE_URL"];
+    else process.env["ACP_GLM_BASE_URL"] = savedBase;
+    const dispatcher = (agent as unknown as {
+      _glm?: { dispatcher?: { destroy: () => Promise<void> } };
+    })._glm?.dispatcher;
+    await dispatcher?.destroy().catch(() => undefined);
+    await agent.shutdown("sigterm").catch(() => undefined);
+    await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("two connection drops in a row both cancel and the session stays usable", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-transport-twice-"));
   const store = new SessionStore(join(cwd, "sessions"));
