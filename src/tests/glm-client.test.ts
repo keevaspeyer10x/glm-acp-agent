@@ -9,6 +9,7 @@ import OpenAI from "openai";
 import {
   GlmClient,
   ModelStreamIdleTimeoutError,
+  PROVIDER_MAX_RETRIES,
   getAvailableModels,
   getDefaultModel,
   getContextWindow,
@@ -666,52 +667,114 @@ test("isRecoverableTransportError accepts connection drops and rejects HTTP stat
     isRecoverableTransportError(new OpenAI.APIConnectionError({ message: "Connection error." })),
     true
   );
+  assert.equal(
+    isRecoverableTransportError(new OpenAI.APIConnectionTimeoutError({ message: "Request timed out." })),
+    true
+  );
+  const withStatus = new OpenAI.APIConnectionError({ message: "Connection error." });
+  Object.assign(withStatus, { status: 502 });
+  assert.equal(isRecoverableTransportError(withStatus), false);
   assert.equal(isRecoverableTransportError(Object.assign(new Error("reset"), { code: "ECONNRESET" })), true);
   assert.equal(isRecoverableTransportError(Object.assign(new Error("upstream"), { status: 502 })), false);
   assert.equal(isRecoverableTransportError(new Error("fixture interrupted")), false);
 });
 
-test("streamChat replaces the client after a connection error and retries the open", async () => {
-  process.env["Z_AI_API_KEY"] = "test-key";
-  const c = new GlmClient();
-  let calls = 0;
-  let builds = 0;
-  const stub = {
-    chat: {
-      completions: {
-        create: () => {
-          calls += 1;
-          if (calls === 1) throw new OpenAI.APIConnectionError({ message: "Connection error." });
-          return Promise.resolve(fakeStream([
-            { choices: [{ delta: { content: "back" }, finish_reason: "stop" }] },
-          ]));
-        },
-      },
+interface OwnedDispatcher {
+  closed: boolean;
+  destroyed: boolean;
+  destroy: () => Promise<void>;
+}
+
+function clientInternals(client: GlmClient): {
+  client: unknown;
+  dispatcher: OwnedDispatcher;
+  discardTransport: () => void;
+} {
+  return client as unknown as {
+    client: unknown;
+    dispatcher: OwnedDispatcher;
+    discardTransport: () => void;
+  };
+}
+
+function withSavedEnv(update: Record<string, string | undefined>): () => void {
+  const saved = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(update)) {
+    saved.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  return () => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+}
+
+async function listenLocal(onRequest: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void): Promise<{
+  baseURL: string;
+  close: () => Promise<void>;
+}> {
+  const server = createServer(onRequest);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("test server has no port");
+  return {
+    baseURL: `http://127.0.0.1:${address.port}/v1`,
+    close: () => new Promise((resolve, reject) => {
+      server.close((err) => err ? reject(err) : resolve());
+    }),
+  };
+}
+
+function captureStderr(): { text: () => string; restore: () => void } {
+  const chunks: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  }) as typeof process.stderr.write;
+  return {
+    text: () => chunks.join(""),
+    restore: () => {
+      process.stderr.write = original;
     },
   };
-  const client = c as unknown as { client: unknown; buildClient: () => unknown };
-  client.client = stub;
-  client.buildClient = () => {
-    builds += 1;
-    return stub;
-  };
-  const text: string[] = [];
+}
+
+test("each provider client owns a connection pool and a failed rebuild keeps the old one", () => {
+  const restore = withSavedEnv({ Z_AI_API_KEY: "test-key" });
   try {
-    for await (const chunk of c.streamChat([])) {
-      if (chunk.text) text.push(chunk.text);
+    const first = new GlmClient();
+    const second = new GlmClient();
+    const firstPool = clientInternals(first).dispatcher;
+    const secondPool = clientInternals(second).dispatcher;
+    assert.notEqual(firstPool, secondPool);
+    const logs = captureStderr();
+    try {
+      const restoreKey = withSavedEnv({ Z_AI_API_KEY: undefined });
+      try {
+        clientInternals(first).discardTransport();
+      } finally {
+        restoreKey();
+      }
+      assert.match(logs.text(), /keeping the existing client/);
+    } finally {
+      logs.restore();
     }
+    assert.equal(clientInternals(first).dispatcher, firstPool);
+    assert.equal(firstPool.destroyed, false);
   } finally {
-    delete process.env["Z_AI_API_KEY"];
+    restore();
   }
-  assert.deepEqual(text, ["back"]);
-  assert.equal(calls, 2);
-  assert.equal(builds, 1);
 });
 
-test("streamChat replaces the client when the body fails with a socket reset", async () => {
-  process.env["Z_AI_API_KEY"] = "test-key";
-  const c = new GlmClient();
-  let builds = 0;
+test("streamChat closes the connection pool when the body fails with a socket reset", async () => {
+  const restore = withSavedEnv({ Z_AI_API_KEY: "test-key" });
+  const client = new GlmClient();
+  const internals = clientInternals(client);
+  const previous = internals.dispatcher;
   const broken = {
     [Symbol.asyncIterator]() {
       return {
@@ -721,21 +784,92 @@ test("streamChat replaces the client when the body fails with a socket reset", a
       };
     },
   };
-  const stub = { chat: { completions: { create: () => Promise.resolve(broken) } } };
-  const client = c as unknown as { client: unknown; buildClient: () => unknown };
-  client.client = stub;
-  client.buildClient = () => {
-    builds += 1;
-    return stub;
-  };
+  internals.client = { chat: { completions: { create: () => Promise.resolve(broken) } } };
   try {
     await assert.rejects(async () => {
-      for await (const _chunk of c.streamChat([])) {
-        void _chunk;
+      for await (const chunk of client.streamChat([])) {
+        void chunk;
       }
     });
+    assert.notEqual(internals.dispatcher, previous);
+    assert.equal(previous.destroyed, true);
   } finally {
-    delete process.env["Z_AI_API_KEY"];
+    await internals.dispatcher.destroy().catch(() => undefined);
+    restore();
   }
-  assert.equal(builds, 1);
+});
+
+test("a dropped connection retries twice, logs each attempt, and then replaces the pool", async () => {
+  assert.equal(PROVIDER_MAX_RETRIES, 2);
+  let attempts = 0;
+  const server = await listenLocal((req) => {
+    attempts += 1;
+    req.socket.destroy();
+  });
+  const restore = withSavedEnv({ Z_AI_API_KEY: "test-key", ACP_GLM_BASE_URL: server.baseURL });
+  const client = new GlmClient();
+  const previous = clientInternals(client).dispatcher;
+  // The client captured the base URL. Put the process env back before the
+  // await so other tests are not pointed at this server. The key stays until
+  // the failure has rebuilt the client.
+  const savedBase = process.env["ACP_GLM_BASE_URL"];
+  delete process.env["ACP_GLM_BASE_URL"];
+  const logs = captureStderr();
+  try {
+    await assert.rejects(async () => {
+      for await (const chunk of client.streamChat([])) {
+        void chunk;
+      }
+    }, OpenAI.APIConnectionError);
+    assert.equal(attempts, PROVIDER_MAX_RETRIES + 1);
+    const stderr = logs.text();
+    assert.match(stderr, /provider request attempt 1 failed: code=\S+/);
+    assert.match(stderr, /provider request attempt 2 failed: code=\S+/);
+    assert.match(stderr, /provider request attempt 3 failed: code=\S+/);
+    assert.notEqual(clientInternals(client).dispatcher, previous);
+    assert.equal(previous.destroyed, true);
+  } finally {
+    if (savedBase === undefined) delete process.env["ACP_GLM_BASE_URL"];
+    else process.env["ACP_GLM_BASE_URL"] = savedBase;
+    logs.restore();
+    await clientInternals(client).dispatcher.destroy().catch(() => undefined);
+    restore();
+    await server.close();
+  }
+});
+
+test("HTTP 408, 409, 429, and 5xx use the same retry budget and 400 does not", async () => {
+  const statuses = [408, 409, 429, 500, 502, 400];
+  let status = 408;
+  let attempts = 0;
+  const server = await listenLocal((_req, res) => {
+    attempts += 1;
+    res.writeHead(status, {
+      "content-type": "application/json",
+      "retry-after-ms": "0",
+    });
+    res.end(JSON.stringify({ error: { message: `status ${status}` } }));
+  });
+  const restore = withSavedEnv({ Z_AI_API_KEY: "test-key", ACP_GLM_BASE_URL: server.baseURL });
+  const client = new GlmClient();
+  delete process.env["ACP_GLM_BASE_URL"];
+  const pool = clientInternals(client).dispatcher;
+  try {
+    for (const code of statuses) {
+      status = code;
+      attempts = 0;
+      await assert.rejects(async () => {
+        for await (const chunk of client.streamChat([])) {
+          void chunk;
+        }
+      });
+      const expected = code === 400 ? 1 : PROVIDER_MAX_RETRIES + 1;
+      assert.equal(attempts, expected, `status ${code} should make ${expected} HTTP attempts`);
+      assert.equal(clientInternals(client).dispatcher, pool, `status ${code} must not replace the connection pool`);
+    }
+  } finally {
+    restore();
+    await pool.destroy().catch(() => undefined);
+    await server.close();
+  }
 });
